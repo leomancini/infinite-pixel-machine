@@ -4,23 +4,28 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently -n vite,server -c cyan,magenta \"vite\" \"node --watch server.js\"",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev:vite": "vite",
+    "dev:server": "node --watch server.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
+    "@anthropic-ai/sdk": "^1.6.0",
+    "@fontsource/silkscreen": "^5.3.0",
+    "better-sqlite3": "^11.0.0",
     "dotenv": "^16.4.7",
+    "express": "^4.19.2",
+    "matter-js": "^0.20.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "styled-components": "^6.1.11",
-    "express": "^4.19.2",
-    "better-sqlite3": "^11.0.0"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.2.5",
     "vite": "^6.0.0"
   }
 }
-
