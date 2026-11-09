@@ -243,7 +243,9 @@ function App() {
     if (!DISPLAY_KEY) return undefined;
     const canvas = canvasRef.current;
     canvas.style.transform = ""; // clear any leftover sub-pixel nudge from an earlier build
-    const ctx = canvas.getContext("2d");
+    // Opaque canvas: the background is always painted, so the compositor can
+    // skip blending it with the page.
+    const ctx = canvas.getContext("2d", { alpha: false });
 
     // --- physics world -----------------------------------------------------
     const engine = Engine.create({ enableSleeping: true });
@@ -552,8 +554,19 @@ function App() {
       lastTick = now;
 
       // Two 60Hz physics substeps keep the simulation identical to before.
-      Engine.update(engine, 1000 / 60);
-      Engine.update(engine, 1000 / 60);
+      // Once every piece is asleep or frozen nothing can move until the next
+      // drop, so the engine is not stepped at all.
+      let awake = false;
+      for (const body of pieces.values()) {
+        if (!body.isStatic && !body.isSleeping) {
+          awake = true;
+          break;
+        }
+      }
+      if (awake) {
+        Engine.update(engine, 1000 / 60);
+        Engine.update(engine, 1000 / 60);
+      }
 
       // Background eases toward the latest item's color.
       const k = 1 - Math.exp(-BG_FADE_RATE * dt);
