@@ -153,15 +153,21 @@ function wrapToLines(ghost, text) {
   return lines.join("\n");
 }
 
-// Caption typewriter: type the description over the first part of the
-// interval, hold it, then untype it so it is gone when the timer hits 0.
-const TYPE_UNTIL = 0.3; // fraction of the interval spent typing
+// Caption typewriter, all within one countdown interval: a short pause after
+// the previous caption finished untyping, then type the new description, hold
+// it, then untype it so it is gone exactly when the timer hits 0.
+const TYPE_PAUSE_MS = 1000; // silence at the start of the interval
+const TYPE_FRACTION = 0.3; // fraction of the interval spent typing
 const UNTYPE_FROM = 0.72; // fraction of the interval at which untyping starts
-function visibleChars(text, progress) {
+function visibleChars(text, elapsedMs, intervalMs) {
   const n = text.length;
-  if (progress < TYPE_UNTIL) return Math.floor((progress / TYPE_UNTIL) * n);
-  if (progress < UNTYPE_FROM) return n;
-  return Math.ceil((1 - (progress - UNTYPE_FROM) / (1 - UNTYPE_FROM)) * n);
+  const typeStart = Math.min(TYPE_PAUSE_MS, intervalMs * 0.3);
+  const typeEnd = Math.min(typeStart + TYPE_FRACTION * intervalMs, intervalMs * 0.6);
+  const untypeStart = Math.max(UNTYPE_FROM * intervalMs, typeEnd);
+  if (elapsedMs < typeStart) return 0;
+  if (elapsedMs < typeEnd) return Math.floor(((elapsedMs - typeStart) / (typeEnd - typeStart)) * n);
+  if (elapsedMs < untypeStart) return n;
+  return Math.ceil((1 - (elapsedMs - untypeStart) / (intervalMs - untypeStart)) * n);
 }
 
 // Keep --stage-scale equal to the largest scale at which 768x1024 fits the window.
@@ -451,8 +457,8 @@ function App() {
       }
       const caption = captionRef.current;
       if (caption) {
-        const progress = Math.min(1, Math.max(0, 1 - remaining / intervalMs));
-        const next = captionText.slice(0, visibleChars(captionText, progress));
+        const elapsed = Math.min(intervalMs, Math.max(0, intervalMs - remaining));
+        const next = captionText.slice(0, visibleChars(captionText, elapsed, intervalMs));
         if (caption.textContent !== next) caption.textContent = next;
       }
 
