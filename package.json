@@ -1,0 +1,26 @@
+{
+  "name": "infinite-pixel-machine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "dotenv": "^16.4.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "styled-components": "^6.1.11",
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.0"
+  }
+}
+
