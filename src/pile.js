@@ -61,11 +61,13 @@ export function makeBody(turn, x, y, { angle = 0, isStatic = false } = {}) {
   return body;
 }
 
-export function drawBody(ctx, body) {
+// `k` is canvas-units-to-device-pixels; positions snap to device pixels so a
+// resting sprite is always sampled the same way.
+export function drawBody(ctx, body, k = 1) {
   const { sprite, offset } = body.plugin;
   if (!sprite) return;
   ctx.save();
-  ctx.translate(body.position.x, body.position.y);
+  ctx.translate(Math.round(body.position.x * k) / k, Math.round(body.position.y * k) / k);
   ctx.rotate(body.angle);
   ctx.drawImage(sprite, offset.x, offset.y);
   ctx.restore();

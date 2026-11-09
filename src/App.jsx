@@ -31,6 +31,8 @@ const REMOVE_BELOW = 1600; // px below the bottom edge before a body is dropped 
 const SETTLED_SPEED = 0.35;
 const SETTLE_AGE_MS = 1500;
 const MAX_CATCHUP = 60; // at most this many unseen turns get dropped on load
+const FRAME_MS = 1000 / 30; // physics and rendering run at 30fps (two 60Hz physics substeps per frame)
+const LAYER_MARGIN = 512; // extra world px above and below the view kept in the baked heap layer
 const BG_FADE_RATE = 0.6; // fraction of the remaining color difference closed per second
 
 const hexToRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
@@ -171,10 +173,12 @@ function visibleChars(text, elapsedMs, intervalMs) {
 }
 
 // Keep --stage-scale equal to the largest scale at which 768x1024 fits the window.
+let stageScale = 1;
 function useFitScale() {
   useEffect(() => {
     const update = () => {
       const scale = Math.min(window.innerWidth / STAGE_WIDTH, window.innerHeight / STAGE_HEIGHT);
+      stageScale = scale;
       document.documentElement.style.setProperty("--stage-scale", String(scale));
     };
     update();
@@ -234,6 +238,7 @@ function App() {
   useEffect(() => {
     if (!DISPLAY_KEY) return undefined;
     const canvas = canvasRef.current;
+    canvas.style.transform = ""; // clear any leftover sub-pixel nudge from an earlier build
     const ctx = canvas.getContext("2d");
 
     // --- physics world -----------------------------------------------------
@@ -391,15 +396,137 @@ function App() {
       if (document.visibilityState === "hidden") saveSnapshot(true);
     };
 
+    // --- rendering ------------------------------------------------------------
+    // Resting sprites are baked once into an offscreen "heap layer" that covers
+    // the visible window plus a margin, so each frame draws that one image plus
+    // whatever is still moving. Frames are skipped entirely when nothing changed.
+    const layer = document.createElement("canvas");
+    const layerCtx = layer.getContext("2d");
+    let layerTop = 0; // world y at the top of the layer
+    let layerPx = 0; // device pixels per world unit the layer was baked at
+    let layerValid = false;
+    const baked = new Map(); // body -> { x, y, angle } pose it was baked with
+
+    const atRest = (body) => body.isStatic || body.isSleeping;
+    const poseChanged = (body, pose) =>
+      Math.abs(body.position.x - pose.x) > 0.25 ||
+      Math.abs(body.position.y - pose.y) > 0.25 ||
+      Math.abs(body.angle - pose.angle) > 0.005;
+
+    const bakeBody = (body) => {
+      drawBody(layerCtx, body, layerPx);
+      baked.set(body, { x: body.position.x, y: body.position.y, angle: body.angle });
+    };
+
+    const rebuildLayer = (px) => {
+      layerPx = px;
+      layerTop = cameraY - LAYER_MARGIN;
+      const h = STAGE_HEIGHT + LAYER_MARGIN * 2;
+      const bw = Math.round(STAGE_WIDTH * px);
+      const bh = Math.round(h * px);
+      if (layer.width !== bw || layer.height !== bh) {
+        layer.width = bw;
+        layer.height = bh;
+      } else {
+        layerCtx.setTransform(1, 0, 0, 1, 0, 0);
+        layerCtx.clearRect(0, 0, bw, bh);
+      }
+      layerCtx.imageSmoothingEnabled = false;
+      layerCtx.setTransform(px, 0, 0, px, 0, -Math.round(layerTop * px));
+      baked.clear();
+      for (const body of pieces.values()) {
+        if (atRest(body) && body.bounds.max.y >= layerTop && body.bounds.min.y <= layerTop + h) bakeBody(body);
+      }
+      layerValid = true;
+    };
+
+    let lastDrawCamDev = null; // camera offset in device px at the last draw
+    let lastDrawBg = [-1, -1, -1];
+    let lastDrawW = 0;
+    let lastDrawH = 0;
+
+    const render = () => {
+      const px = stageScale * (window.devicePixelRatio || 1);
+      const bw = Math.round(STAGE_WIDTH * px);
+      const bh = Math.round(STAGE_HEIGHT * px);
+      const camDev = Math.round(cameraY * px);
+
+      // Keep the baked layer in step with the world.
+      if (!layerValid || px !== layerPx || cameraY < layerTop + 64 || cameraY + STAGE_HEIGHT > layerTop + STAGE_HEIGHT + LAYER_MARGIN * 2 - 64) {
+        rebuildLayer(px);
+      }
+      let layerChanged = false;
+      for (const body of pieces.values()) {
+        const pose = baked.get(body);
+        if (pose) {
+          if (!body.isStatic && !body.isSleeping && poseChanged(body, pose)) {
+            // A resting piece got knocked: rebuild so it is drawn live again.
+            rebuildLayer(px);
+            layerChanged = true;
+            break;
+          }
+        } else if (atRest(body) && body.bounds.max.y >= layerTop) {
+          layerCtx.setTransform(px, 0, 0, px, 0, -Math.round(layerTop * px));
+          bakeBody(body);
+          layerChanged = true;
+        }
+      }
+
+      // Anything still moving gets drawn live.
+      const bottom = cameraY + STAGE_HEIGHT;
+      const live = [];
+      for (const body of pieces.values()) {
+        if (baked.has(body)) continue;
+        if (body.bounds.max.y < cameraY - 50 || body.bounds.min.y > bottom + 50) continue;
+        live.push(body);
+      }
+
+      const bgRounded = bg.map(Math.round);
+      const bgChanged = bgRounded.some((c, i) => c !== lastDrawBg[i]);
+      const needsDraw =
+        layerChanged ||
+        live.length > 0 ||
+        camDev !== lastDrawCamDev ||
+        bgChanged ||
+        bw !== lastDrawW ||
+        bh !== lastDrawH;
+      if (!needsDraw) return;
+
+      if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;
+        canvas.height = bh;
+      }
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = `rgb(${bgRounded.join(",")})`;
+      ctx.fillRect(0, 0, bw, bh);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(layer, 0, Math.round(layerTop * px) - camDev);
+      ctx.setTransform(px, 0, 0, px, 0, -camDev);
+      for (const body of live) drawBody(ctx, body, px);
+
+      lastDrawCamDev = camDev;
+      lastDrawBg = bgRounded;
+      lastDrawW = bw;
+      lastDrawH = bh;
+    };
+
     // --- frame loop ----------------------------------------------------------
+    let lastTick = 0;
     const frame = (now) => {
-      const dt = Math.min(0.05, (now - lastFrame) / 1000);
+      raf = requestAnimationFrame(frame);
+      if (now - lastTick < FRAME_MS - 1) return; // 30fps cap
+      const dt = Math.min(0.1, (now - lastFrame) / 1000);
       lastFrame = now;
+      lastTick = now;
+
+      // Two 60Hz physics substeps keep the simulation identical to before.
+      Engine.update(engine, 1000 / 60);
       Engine.update(engine, 1000 / 60);
 
-      // Camera always drifts upward at a slow constant crawl. When the heap's
-      // top climbs above its ideal line it eases faster to catch up, closing a
-      // fraction of the gap each second, capped. It never moves down.
+      // Background eases toward the latest item's color.
+      const k = 1 - Math.exp(-BG_FADE_RATE * dt);
+      bg = bg.map((c, i) => c + (targetBg[i] - c) * k);
+
       // The camera holds still while the heap is low. Once the heap's top gets
       // within CAMERA_START_ZONE px of the middle the drift ramps up from zero
       // to the normal crawl, reaching full speed as the top hits the middle.
@@ -418,25 +545,13 @@ function App() {
         if (body.bounds.min.y > bottom + REMOVE_BELOW) {
           Composite.remove(world, body);
           pieces.delete(id);
+          baked.delete(body);
         } else if (!body.isStatic && body.bounds.min.y > bottom + FREEZE_BELOW && isSettled(body)) {
           Body.setStatic(body, true);
         }
       }
 
-      // Background eases toward the latest item's color.
-      const k = 1 - Math.exp(-BG_FADE_RATE * dt);
-      bg = bg.map((c, i) => c + (targetBg[i] - c) * k);
-
-      // Draw.
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.fillStyle = `rgb(${bg.map(Math.round).join(",")})`;
-      ctx.fillRect(0, 0, STAGE_WIDTH, STAGE_HEIGHT);
-      ctx.imageSmoothingEnabled = false;
-      ctx.translate(0, -cameraY);
-      for (const body of pieces.values()) {
-        if (body.bounds.max.y < cameraY - 50 || body.bounds.min.y > bottom + 50) continue;
-        drawBody(ctx, body);
-      }
+      render();
 
       // Countdown to the next drop.
       const remaining = Math.max(0, nextRevealAt - Date.now());
@@ -461,8 +576,6 @@ function App() {
         const next = captionText.slice(0, visibleChars(captionText, elapsed, intervalMs));
         if (caption.textContent !== next) caption.textContent = next;
       }
-
-      raf = requestAnimationFrame(frame);
     };
 
     // --- startup -------------------------------------------------------------
