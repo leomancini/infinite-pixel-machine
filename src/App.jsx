@@ -39,6 +39,22 @@ const FRAME_MS = 1000 / 30; // physics and rendering run at 30fps (two 60Hz phys
 const LAYER_MARGIN = 512; // extra world px above and below the view kept in the baked heap layer
 const BG_FADE_RATE = 0.6; // fraction of the remaining color difference closed per second
 
+// ?debug=1 overlays a once-a-second readout of where each frame's time goes.
+const DEBUG = new URLSearchParams(window.location.search).get("debug") === "1";
+
+// Name of the graphics renderer, which shows whether the browser is drawing
+// with the GPU or a software fallback (llvmpipe, SwiftShader).
+function gpuRenderer() {
+  try {
+    const gl = document.createElement("canvas").getContext("webgl");
+    if (!gl) return "no webgl";
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    return String(info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+  } catch {
+    return "unknown";
+  }
+}
+
 const hexToRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
 
 const Viewport = styled.div`
@@ -51,6 +67,16 @@ const Viewport = styled.div`
   overflow: hidden;
 `;
 
+// Quarter turns clockwise from the URL (?rotate=90, 180 or 270). Lets a
+// portrait display run its screen unrotated and have the browser's GPU
+// compositor turn the page instead: rotating the whole screen in the X server
+// is done in software and costs a Pi 3 most of a CPU core.
+const ROTATE = (() => {
+  const n = Number(new URLSearchParams(window.location.search).get("rotate"));
+  return [90, 180, 270].includes(n) ? n : 0;
+})();
+const SIDEWAYS = ROTATE === 90 || ROTATE === 270;
+
 // Fixed 768x1024 stage. Fills a 768x1024 display 1:1 and scales to fit
 // (letterboxed) on any other screen size, so the layout math never changes.
 const Stage = styled.div`
@@ -61,7 +87,7 @@ const Stage = styled.div`
   background: #000;
   color: #fff;
   overflow: hidden;
-  transform: scale(var(--stage-scale, 1));
+  transform: rotate(${ROTATE}deg) scale(var(--stage-scale, 1));
   transform-origin: center center;
 `;
 
@@ -176,12 +202,15 @@ function visibleChars(text, elapsedMs, intervalMs) {
   return Math.ceil((1 - (elapsedMs - untypeStart) / (untypeEnd - untypeStart)) * n);
 }
 
-// Keep --stage-scale equal to the largest scale at which 768x1024 fits the window.
+// Keep --stage-scale equal to the largest scale at which 768x1024 fits the
+// window (measured after any ?rotate turn).
 let stageScale = 1;
 function useFitScale() {
   useEffect(() => {
     const update = () => {
-      const scale = Math.min(window.innerWidth / STAGE_WIDTH, window.innerHeight / STAGE_HEIGHT);
+      const w = SIDEWAYS ? window.innerHeight : window.innerWidth;
+      const h = SIDEWAYS ? window.innerWidth : window.innerHeight;
+      const scale = Math.min(w / STAGE_WIDTH, h / STAGE_HEIGHT);
       stageScale = scale;
       document.documentElement.style.setProperty("--stage-scale", String(scale));
     };
@@ -441,6 +470,33 @@ function App() {
     let layerValid = false;
     const baked = new Map(); // body -> { x, y, angle } pose it was baked with
 
+    // Debug readout (?debug=1): counters reset every second.
+    const stats = { callbacks: 0, ticks: 0, draws: 0, rebuilds: 0, physics: 0, render: 0, worst: 0, since: 0 };
+    let hud = null;
+    if (DEBUG) {
+      hud = document.createElement("pre");
+      hud.style.cssText =
+        "position:fixed;left:0;bottom:0;margin:0;padding:6px 8px;z-index:9;background:rgba(0,0,0,.8);color:#0f0;font:14px/1.3 monospace;white-space:pre";
+      document.body.appendChild(hud);
+    }
+    const renderer = DEBUG ? gpuRenderer() : "";
+    const updateHud = (now) => {
+      const secs = (now - stats.since) / 1000;
+      if (secs < 1) return;
+      let awakeCount = 0;
+      for (const body of pieces.values()) if (!body.isStatic && !body.isSleeping) awakeCount++;
+      const per = (ms) => (stats.ticks ? (ms / stats.ticks).toFixed(1) : "0.0");
+      hud.textContent = [
+        `raf ${(stats.callbacks / secs).toFixed(0)}/s  ticks ${(stats.ticks / secs).toFixed(0)}/s  draws ${(stats.draws / secs).toFixed(0)}/s`,
+        `physics ${per(stats.physics)}ms  render ${per(stats.render)}ms  worst tick ${stats.worst.toFixed(0)}ms`,
+        `bodies ${pieces.size} (${awakeCount} awake)  layer rebuilds ${stats.rebuilds}`,
+        `canvas ${canvas.width}x${canvas.height}  window ${window.innerWidth}x${window.innerHeight}  dpr ${window.devicePixelRatio}`,
+        `mem ${performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) + "MB js" : "n/a"}  cores ${navigator.hardwareConcurrency}`,
+        renderer,
+      ].join("\n");
+      Object.assign(stats, { callbacks: 0, ticks: 0, draws: 0, rebuilds: 0, physics: 0, render: 0, worst: 0, since: now });
+    };
+
     const atRest = (body) => body.isStatic || body.isSleeping;
     const poseChanged = (body, pose) =>
       Math.abs(body.position.x - pose.x) > 0.25 ||
@@ -453,6 +509,7 @@ function App() {
     };
 
     const rebuildLayer = (px) => {
+      stats.rebuilds++;
       layerPx = px;
       layerTop = cameraY - LAYER_MARGIN;
       const h = STAGE_HEIGHT + LAYER_MARGIN * 2;
@@ -525,6 +582,7 @@ function App() {
         bw !== lastDrawW ||
         bh !== lastDrawH;
       if (!needsDraw) return;
+      stats.draws++;
 
       if (canvas.width !== bw || canvas.height !== bh) {
         canvas.width = bw;
@@ -548,6 +606,7 @@ function App() {
     let lastTick = 0;
     const frame = (now) => {
       raf = requestAnimationFrame(frame);
+      stats.callbacks++;
       if (now - lastTick < FRAME_MS - 1) return; // 30fps cap
       const dt = Math.min(0.1, (now - lastFrame) / 1000);
       lastFrame = now;
@@ -556,6 +615,7 @@ function App() {
       // Two 60Hz physics substeps keep the simulation identical to before.
       // Once every piece is asleep or frozen nothing can move until the next
       // drop, so the engine is not stepped at all.
+      const t0 = performance.now();
       let awake = false;
       for (const body of pieces.values()) {
         if (!body.isStatic && !body.isSleeping) {
@@ -598,7 +658,16 @@ function App() {
         }
       }
 
+      const t1 = performance.now();
       render();
+      if (hud) {
+        const t2 = performance.now();
+        stats.ticks++;
+        stats.physics += t1 - t0;
+        stats.render += t2 - t1;
+        stats.worst = Math.max(stats.worst, t2 - t0);
+        updateHud(now);
+      }
 
       // Countdown to the next drop.
       const remaining = Math.max(0, nextRevealAt - Date.now());
@@ -697,6 +766,7 @@ function App() {
       cancelAnimationFrame(raf);
       document.removeEventListener("visibilitychange", onVisibility);
       Engine.clear(engine);
+      hud?.remove();
     };
   }, []);
 
