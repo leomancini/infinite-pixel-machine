@@ -17,6 +17,8 @@ const MIN_TURN_INTERVAL_MS = 3_000;
 const MAX_TURN_INTERVAL_MS = 600_000;
 let turnIntervalMs = DEFAULT_TURN_INTERVAL_MS; // the display sets this via ?speed=
 const RECENT_KEEP = 300; // turns kept in memory for the API
+const DB_KEEP_TURNS = 2000; // older turns are pruned from SQLite unless the saved pile still references them
+const PRUNE_EVERY_MS = 60 * 60_000;
 const CONTEXT_FOR_MODEL = 40; // recent items described to the model
 const TIME_ZONE = "America/New_York";
 const DISPLAY_KEY = process.env.DISPLAY_KEY || "";
@@ -55,17 +57,15 @@ const setMeta = (key, value) => {
   ).run(key, JSON.stringify(value));
 };
 
-let totalItems = db.prepare("SELECT COUNT(*) AS n FROM turns").get().n;
+// Lifetime count lives in meta so pruning old rows doesn't reset it.
+let totalItems = getMeta("totalItems") ?? db.prepare("SELECT COUNT(*) AS n FROM turns").get().n;
+
+// Only id, time and item are kept in memory; the context each turn saw stays in SQLite.
 let recent = db
-  .prepare("SELECT id, created_at, item, context FROM turns ORDER BY id DESC LIMIT ?")
+  .prepare("SELECT id, created_at, item FROM turns ORDER BY id DESC LIMIT ?")
   .all(RECENT_KEEP)
   .reverse()
-  .map((row) => ({
-    id: row.id,
-    createdAt: row.created_at,
-    item: JSON.parse(row.item),
-    context: JSON.parse(row.context),
-  }));
+  .map((row) => ({ id: row.id, createdAt: row.created_at, item: JSON.parse(row.item) }));
 
 // The display saves the physics state of the pile here so a reload can
 // restore it instead of re-dropping everything.
@@ -83,12 +83,30 @@ function saveTurn(item, context) {
   const result = db
     .prepare("INSERT INTO turns (created_at, item, context) VALUES (?, ?, ?)")
     .run(createdAt, JSON.stringify(item), JSON.stringify(context));
-  const turn = { id: Number(result.lastInsertRowid), createdAt, item, context };
+  const turn = { id: Number(result.lastInsertRowid), createdAt, item };
   recent.push(turn);
-  if (recent.length > RECENT_KEEP) recent = recent.slice(-RECENT_KEEP);
+  if (recent.length > RECENT_KEEP) recent.splice(0, recent.length - RECENT_KEEP);
   totalItems += 1;
+  setMeta("totalItems", totalItems);
   return turn;
 }
+
+// Drop old rows the display can never need again: anything older than the
+// last DB_KEEP_TURNS that the saved pile doesn't reference.
+function pruneDb() {
+  const latest = recent.length ? recent[recent.length - 1].id : 0;
+  const cutoff = latest - DB_KEEP_TURNS;
+  if (cutoff <= 0) return;
+  const keep = new Set((snapshot?.bodies || []).map((b) => b.turnId));
+  const candidates = db.prepare("SELECT id FROM turns WHERE id < ?").all(cutoff).map((r) => r.id);
+  const doomed = candidates.filter((id) => !keep.has(id));
+  if (doomed.length === 0) return;
+  const del = db.prepare("DELETE FROM turns WHERE id = ?");
+  db.transaction(() => doomed.forEach((id) => del.run(id)))();
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  console.log(`Pruned ${doomed.length} old turns from the database`);
+}
+setInterval(pruneDb, PRUNE_EVERY_MS).unref();
 
 // ---------------------------------------------------------------------------
 // Context sources

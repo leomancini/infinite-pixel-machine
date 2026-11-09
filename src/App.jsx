@@ -27,10 +27,14 @@ const CAMERA_MAX_SPEED = 6; // px per second cap when catching up to a tall heap
 const CAMERA_GAIN = 0.05; // fraction of the remaining distance closed per second
 const PILE_TOP_SCREEN_Y = 0.4 * STAGE_HEIGHT; // heap fills the bottom 60%: its top line sits 40% down the screen
 const FREEZE_BELOW = 150; // px below the bottom edge before a resting body is frozen
-const REMOVE_BELOW = 1600; // px below the bottom edge before a body is dropped from the world
+// The camera only moves up, so anything this far below the view can never be
+// seen again and is dropped from the world (along with its sprite bitmap).
+// Kept just past LAYER_MARGIN so the baked layer stays complete.
+const REMOVE_BELOW = 620;
 const SETTLED_SPEED = 0.35;
 const SETTLE_AGE_MS = 1500;
 const MAX_CATCHUP = 60; // at most this many unseen turns get dropped on load
+const REVEALED_KEEP = 20; // revealed turns kept in the queue before it is compacted
 const FRAME_MS = 1000 / 30; // physics and rendering run at 30fps (two 60Hz physics substeps per frame)
 const LAYER_MARGIN = 512; // extra world px above and below the view kept in the baked heap layer
 const BG_FADE_RATE = 0.6; // fraction of the remaining color difference closed per second
@@ -261,9 +265,10 @@ function App() {
     let bg = [0, 0, 0]; // current background color, eased toward targetBg
     let targetBg = [0, 0, 0];
     const pieces = new Map(); // turnId -> body
-    const turns = []; // known turns, ascending by id
-    const spawned = new Set();
+    const turns = []; // queue of known turns, ascending by id; revealed ones are trimmed
+    const spawned = new Set(); // turn ids currently in the world
     let shown = 0; // index into turns of the next turn to drop
+    let lastKnownId = 0; // highest turn id received from the server
     let intervalMs = speedFromUrl() * 1000;
     let nextRevealAt = 0;
     let epoch = null;
@@ -333,6 +338,15 @@ function App() {
       drop(turn);
       showCaption(turn);
       setBackground(turn.item);
+      compactTurns();
+    };
+
+    // Forget revealed turns so the queue doesn't grow for as long as the page runs.
+    const compactTurns = () => {
+      if (shown > REVEALED_KEEP) {
+        turns.splice(0, shown);
+        shown = 0;
+      }
     };
 
     const visible = () => document.visibilityState === "visible";
@@ -340,8 +354,7 @@ function App() {
     const poll = async () => {
       if (!visible()) return; // a hidden tab neither fetches nor keeps the server generating
       try {
-        const after = turns.length ? turns[turns.length - 1].id : 0;
-        const res = await fetch(api(`/api/turns?after=${after}&active=1`));
+        const res = await fetch(api(`/api/turns?after=${lastKnownId}&active=1`));
         if (res.status === 401) {
           setNoKey(true);
           return;
@@ -354,7 +367,10 @@ function App() {
           return;
         }
         for (const t of data.turns) {
-          if (!turns.length || t.id > turns[turns.length - 1].id) turns.push(t);
+          if (t.id > lastKnownId) {
+            turns.push(t);
+            lastKnownId = t.id;
+          }
         }
       } catch (err) {
         console.warn("poll failed", err);
@@ -405,6 +421,7 @@ function App() {
       // display picks up live rather than replaying a backlog.
       poll().then(() => {
         shown = Math.max(shown, turns.length - DISPLAY_LAG);
+        compactTurns();
         nextRevealAt = Date.now() + intervalMs;
         captionText = "";
         lastFrame = performance.now();
@@ -561,6 +578,8 @@ function App() {
           Composite.remove(world, body);
           pieces.delete(id);
           baked.delete(body);
+          spawned.delete(id);
+          body.plugin.sprite = null; // release the bitmap
         } else if (!body.isStatic && body.bounds.min.y > bottom + FREEZE_BELOW && isSettled(body)) {
           Body.setStatic(body, true);
         }
@@ -617,6 +636,11 @@ function App() {
 
         // Turns generated since the snapshot: drop all but the last DISPLAY_LAG now.
         turns.push(...state.turns);
+        lastKnownId = Math.max(
+          state.snapshot?.latestTurnId || 0,
+          ...state.turns.map((t) => t.id),
+          ...(state.snapshot?.bodies || []).map((b) => b.turnId),
+        );
         const catchUpTo = Math.max(0, turns.length - DISPLAY_LAG);
         const catchUpFrom = Math.max(0, catchUpTo - MAX_CATCHUP);
         for (let i = catchUpFrom; i < catchUpTo; i++) {
