@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 import Matter from "matter-js";
 import { STAGE_WIDTH, STAGE_HEIGHT, CELL } from "../shared/canvas.js";
@@ -8,6 +8,10 @@ const { Engine, Composite, Bodies, Body } = Matter;
 
 const DISPLAY_LAG = 2; // show results this many turns behind the latest generated
 const DEFAULT_SPEED_S = 15; // seconds between drops; override with ?speed=N
+
+// Display key from the URL (?key=...). Required by every API call.
+const DISPLAY_KEY = new URLSearchParams(window.location.search).get("key") || "";
+const api = (path) => `${path}${path.includes("?") ? "&" : "?"}key=${encodeURIComponent(DISPLAY_KEY)}`;
 
 // Seconds between drops from the URL, e.g. /?speed=5. Falls back to the default.
 function speedFromUrl() {
@@ -90,6 +94,18 @@ const Countdown = styled.div`
     width: ${DIGIT_CELL_EM}em;
     text-align: center;
   }
+`;
+
+const NoKey = styled.div`
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-family: "Silkscreen", ui-monospace, monospace;
+  font-size: 32px;
+  color: rgba(255, 255, 255, 0.85);
+  text-transform: uppercase;
 `;
 
 const Caption = styled.div`
@@ -207,8 +223,10 @@ function App() {
   const countdownRef = useRef(null);
   const captionRef = useRef(null);
   const ghostRef = useRef(null);
+  const [noKey, setNoKey] = useState(!DISPLAY_KEY);
 
   useEffect(() => {
+    if (!DISPLAY_KEY) return undefined;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
 
@@ -308,7 +326,11 @@ function App() {
     const poll = async () => {
       try {
         const after = turns.length ? turns[turns.length - 1].id : 0;
-        const res = await fetch(`/api/turns?after=${after}`);
+        const res = await fetch(api(`/api/turns?after=${after}`));
+        if (res.status === 401) {
+          setNoKey(true);
+          return;
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (epoch && data.epoch && data.epoch !== epoch) {
@@ -346,9 +368,9 @@ function App() {
       if (shown === 0 && pieces.size === 0) return;
       const json = JSON.stringify(snapshotPayload());
       if (useBeacon && navigator.sendBeacon) {
-        navigator.sendBeacon("/api/snapshot", new Blob([json], { type: "application/json" }));
+        navigator.sendBeacon(api("/api/snapshot"), new Blob([json], { type: "application/json" }));
       } else {
-        fetch("/api/snapshot", {
+        fetch(api("/api/snapshot"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: json,
@@ -441,7 +463,11 @@ function App() {
     const init = async () => {
       try {
         // Tell the server our drop speed so it generates at the same pace.
-        const res = await fetch(`/api/state?speed=${intervalMs / 1000}`);
+        const res = await fetch(api(`/api/state?speed=${intervalMs / 1000}`));
+        if (res.status === 401) {
+          setNoKey(true);
+          return;
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const state = await res.json();
         if (cancelled) return;
@@ -502,6 +528,16 @@ function App() {
       Engine.clear(engine);
     };
   }, []);
+
+  if (noKey) {
+    return (
+      <Viewport>
+        <Stage>
+          <NoKey>No key set</NoKey>
+        </Stage>
+      </Viewport>
+    );
+  }
 
   return (
     <Viewport>

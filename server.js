@@ -19,6 +19,8 @@ let turnIntervalMs = DEFAULT_TURN_INTERVAL_MS; // the display sets this via ?spe
 const RECENT_KEEP = 300; // turns kept in memory for the API
 const CONTEXT_FOR_MODEL = 40; // recent items described to the model
 const TIME_ZONE = "America/New_York";
+const DISPLAY_KEY = process.env.DISPLAY_KEY || "";
+if (!DISPLAY_KEY) console.warn("DISPLAY_KEY is not set; every display request will be refused");
 
 const anthropic = new Anthropic({ timeout: 90_000, maxRetries: 1 });
 const app = express();
@@ -382,6 +384,15 @@ function setTurnInterval(seconds) {
 
 app.use(express.json({ limit: "5mb" }));
 app.use(express.static(join(__dirname, "dist")));
+
+// Every API request must carry the display key (?key= or x-display-key).
+app.use("/api", (req, res, next) => {
+  const key = req.query.key || req.get("x-display-key");
+  if (!DISPLAY_KEY || key !== DISPLAY_KEY) {
+    return res.status(401).json({ error: "no key set" });
+  }
+  next();
+});
 
 const publicTurn = (t) => ({ id: t.id, createdAt: t.createdAt, item: t.item });
 
