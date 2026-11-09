@@ -178,7 +178,7 @@ const ItemSchema = z.object({
   note: z
     .string()
     .describe(
-      "A short caption shown on screen, at most 12 words. Start directly with the thing itself, never with 'A', 'An' or 'The', and vary the sentence shape from turn to turn. Then give the specific reason it belongs to this moment (the holiday, the historical event, the bloom, the weather, the hour, the market's subject). Examples: 'Hot air balloon for Balloon Ascension Day, 1783', 'Husky pup, because Alaska votes for Senate soon', 'Chrysanthemums are blooming tonight across Brooklyn'. No trailing period. Also shown to you on later turns.",
+      "A short caption shown on screen, at most 12 words. Start directly with the thing itself, never with 'A', 'An' or 'The', and vary the sentence shape from turn to turn. Then give the specific reason it belongs to this moment (the holiday, the historical event, the bloom, the weather, the hour, or the news topic behind the prediction market, without ever mentioning markets, odds, chances or percentages). Examples: 'Hot air balloon for Balloon Ascension Day, 1783', 'Husky pup, because Alaska votes for Senate soon', 'Chrysanthemums are blooming tonight across Brooklyn'. No trailing period. Also shown to you on later turns.",
     ),
   background: z
     .string()
@@ -208,7 +208,7 @@ Every turn you receive the current time in Brooklyn, New York, live context abou
 
 What to draw:
 - One thing per turn: a single object, creature, plant, food, symbol, word, building, vehicle, tool, or curious artifact. Not a scene.
-- Draw things that respond to the moment: the time of day, the weather, the sky color, what is blooming, the holiday, a historical event, or the prediction market. For the market, draw the subject itself: the place, person, team, company, product, animal, event or object the question is about, rendered as a cute sprite (a landmark of the country, a rocket for a launch, a ballot box for an election, a mascot, a trophy). The odds are background flavor at most; do not draw gauges, dials, coins or symbols of probability, and the caption should name the subject rather than the percentage. Vary which source you draw from; do not always pick the same one.
+- Draw things that respond to the moment: the time of day, the weather, the sky color, what is blooming, the holiday, a historical event, or the prediction market. For the market, draw the subject itself: the place, person, team, company, product, animal, event or object the question is about, rendered as a cute sprite (a landmark of the country, a rocket for a launch, a ballot box for an election, a mascot, a trophy). The odds are background flavor at most; do not draw gauges, dials, coins or symbols of probability. The caption must never mention the market, odds, chances, bets, trading or percentages: write about the subject as if it were simply in the news (for example "Husky pup, because Alaska votes for Senate soon"). Vary which source you draw from; do not always pick the same one.
 - Think about the heap. Vary size, weight and shape so the pile stays interesting: a heavy block one turn, something small and round the next, something long the next. Avoid repeating the names or ideas of recent additions.
 - Use the actual sky color from the context when painting sky-lit surfaces or glowing things.
 
@@ -276,7 +276,7 @@ function describeContext(ctx) {
   if (ctx.market) {
     const pct = ctx.market.probability === null ? "unknown" : `${Math.round(ctx.market.probability * 100)}%`;
     parts.push(
-      `A prediction market right now is about: "${ctx.market.question}" (the outcome being traded: "${ctx.market.prediction}", currently ${pct}). Treat the question's subject as the inspiration, not the number.`,
+      `A topic people are currently speculating about: "${ctx.market.question}" (possible outcome: "${ctx.market.prediction}", currently ${pct}). Treat the subject as inspiration, not the number, and never mention markets, odds or percentages in the caption.`,
     );
   }
   return parts.join("\n");

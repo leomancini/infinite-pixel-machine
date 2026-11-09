@@ -25,7 +25,7 @@ const CAMERA_MIN_SPEED = 1; // px per second: the view is always drifting up at 
 const CAMERA_START_ZONE = 160; // px below the middle where the drift begins ramping up from zero
 const CAMERA_MAX_SPEED = 6; // px per second cap when catching up to a tall heap
 const CAMERA_GAIN = 0.05; // fraction of the remaining distance closed per second
-const PILE_TOP_SCREEN_Y = 0.5 * STAGE_HEIGHT; // keep the heap's top line around the middle of the screen
+const PILE_TOP_SCREEN_Y = 0.4 * STAGE_HEIGHT; // heap fills the bottom 60%: its top line sits 40% down the screen
 const FREEZE_BELOW = 150; // px below the bottom edge before a resting body is frozen
 const REMOVE_BELOW = 1600; // px below the bottom edge before a body is dropped from the world
 const SETTLED_SPEED = 0.35;
@@ -153,21 +153,21 @@ function wrapToLines(ghost, text) {
   return lines.join("\n");
 }
 
-// Caption typewriter, all within one countdown interval: a short pause after
-// the previous caption finished untyping, then type the new description, hold
-// it, then untype it so it is gone exactly when the timer hits 0.
-const TYPE_PAUSE_MS = 1000; // silence at the start of the interval
+// Caption typewriter, all within one countdown interval: typing starts the
+// moment the countdown resets, holds, then untypes so the text is gone one
+// second before the timer hits 0, leaving a short silence before the next one.
+const END_PAUSE_MS = 1000; // silence at the end of the interval
 const TYPE_FRACTION = 0.3; // fraction of the interval spent typing
-const UNTYPE_FROM = 0.72; // fraction of the interval at which untyping starts
+const UNTYPE_FROM = 0.68; // fraction of the interval at which untyping starts
 function visibleChars(text, elapsedMs, intervalMs) {
   const n = text.length;
-  const typeStart = Math.min(TYPE_PAUSE_MS, intervalMs * 0.3);
-  const typeEnd = Math.min(typeStart + TYPE_FRACTION * intervalMs, intervalMs * 0.6);
+  const typeEnd = TYPE_FRACTION * intervalMs;
+  const untypeEnd = Math.max(intervalMs - END_PAUSE_MS, intervalMs * 0.7);
   const untypeStart = Math.max(UNTYPE_FROM * intervalMs, typeEnd);
-  if (elapsedMs < typeStart) return 0;
-  if (elapsedMs < typeEnd) return Math.floor(((elapsedMs - typeStart) / (typeEnd - typeStart)) * n);
+  if (elapsedMs < typeEnd) return Math.floor((elapsedMs / typeEnd) * n);
   if (elapsedMs < untypeStart) return n;
-  return Math.ceil((1 - (elapsedMs - untypeStart) / (intervalMs - untypeStart)) * n);
+  if (elapsedMs >= untypeEnd) return 0;
+  return Math.ceil((1 - (elapsedMs - untypeStart) / (untypeEnd - untypeStart)) * n);
 }
 
 // Keep --stage-scale equal to the largest scale at which 768x1024 fits the window.
