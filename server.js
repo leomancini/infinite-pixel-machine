@@ -20,6 +20,7 @@ const RECENT_KEEP = 300; // turns kept in memory for the API
 const CONTEXT_FOR_MODEL = 40; // recent items described to the model
 const TIME_ZONE = "America/New_York";
 const DISPLAY_KEY = process.env.DISPLAY_KEY || "";
+const DISPLAY_IDLE_MS = 30_000; // pause generation this long after the last visible display was heard from
 if (!DISPLAY_KEY) console.warn("DISPLAY_KEY is not set; every display request will be refused");
 
 const anthropic = new Anthropic({ timeout: 90_000, maxRetries: 1 });
@@ -354,10 +355,33 @@ async function runTurn() {
   }
 }
 
-// Start a turn every turnIntervalMs. Turns may overlap (each one only needs
-// the heap as it was when it started), bounded by MAX_IN_FLIGHT.
+// Generation only runs while a visible display is polling. Displays send
+// active=1 with their requests while their tab is visible.
+let lastDisplaySeen = 0;
+let paused = true;
+const displayActive = () => Date.now() - lastDisplaySeen < DISPLAY_IDLE_MS;
+
+function noteDisplayActive() {
+  lastDisplaySeen = Date.now();
+  if (paused) {
+    paused = false;
+    console.log("Display is active; resuming generation");
+    tick(); // don't make a returning display wait a whole interval
+  }
+}
+
+// Start a turn every turnIntervalMs while a display is active. Turns may
+// overlap (each one only needs the heap as it was when it started), bounded
+// by MAX_IN_FLIGHT.
 let loopTimer = null;
 function tick() {
+  if (!displayActive()) {
+    if (!paused) {
+      paused = true;
+      console.log("No active display; pausing generation");
+    }
+    return;
+  }
   if (inFlight < MAX_IN_FLIGHT) runTurn();
   else console.warn(`Skipping a turn: ${inFlight} already in flight`);
 }
@@ -417,6 +441,7 @@ function hydrateSnapshot(snap) {
 // Full state for a fresh display: the saved pile plus any turns since then.
 app.get("/api/state", (req, res) => {
   if (req.query.speed !== undefined) setTurnInterval(req.query.speed);
+  if (req.query.active === "1") noteDisplayActive();
   const since = snapshot?.latestTurnId || 0;
   res.json({
     epoch,
@@ -430,6 +455,7 @@ app.get("/api/state", (req, res) => {
 
 // Incremental: turns after a given id.
 app.get("/api/turns", (req, res) => {
+  if (req.query.active === "1") noteDisplayActive();
   const after = Number(req.query.after) || 0;
   res.json({
     epoch,
@@ -474,6 +500,7 @@ app.get("/api/status", (req, res) => {
     lastError,
     inFlight,
     turnIntervalMs,
+    displayActive: displayActive(),
     snapshot: snapshot
       ? { savedAt: snapshot.savedAt, latestTurnId: snapshot.latestTurnId, bodies: snapshot.bodies.length }
       : null,

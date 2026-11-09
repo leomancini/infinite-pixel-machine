@@ -327,6 +327,7 @@ function App() {
 
     const reveal = () => {
       nextRevealAt = Date.now() + intervalMs;
+      if (!visible()) return;
       if (shown >= turns.length) return;
       const turn = turns[shown++];
       drop(turn);
@@ -334,10 +335,13 @@ function App() {
       setBackground(turn.item);
     };
 
+    const visible = () => document.visibilityState === "visible";
+
     const poll = async () => {
+      if (!visible()) return; // a hidden tab neither fetches nor keeps the server generating
       try {
         const after = turns.length ? turns[turns.length - 1].id : 0;
-        const res = await fetch(api(`/api/turns?after=${after}`));
+        const res = await fetch(api(`/api/turns?after=${after}&active=1`));
         if (res.status === 401) {
           setNoKey(true);
           return;
@@ -392,8 +396,19 @@ function App() {
           .catch((err) => console.warn("snapshot failed", err));
       }
     };
-    const onHide = () => {
-      if (document.visibilityState === "hidden") saveSnapshot(true);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        saveSnapshot(true);
+        return;
+      }
+      // Coming back: skip anything that queued up while we were away, so the
+      // display picks up live rather than replaying a backlog.
+      poll().then(() => {
+        shown = Math.max(shown, turns.length - DISPLAY_LAG);
+        nextRevealAt = Date.now() + intervalMs;
+        captionText = "";
+        lastFrame = performance.now();
+      });
     };
 
     // --- rendering ------------------------------------------------------------
@@ -582,7 +597,7 @@ function App() {
     const init = async () => {
       try {
         // Tell the server our drop speed so it generates at the same pace.
-        const res = await fetch(api(`/api/state?speed=${intervalMs / 1000}`));
+        const res = await fetch(api(`/api/state?speed=${intervalMs / 1000}&active=${visible() ? 1 : 0}`));
         if (res.status === 401) {
           setNoKey(true);
           return;
@@ -626,7 +641,7 @@ function App() {
         pollTimer = setInterval(poll, POLL_MS);
         revealTimer = setInterval(reveal, intervalMs);
         snapshotTimer = setInterval(() => saveSnapshot(false), SNAPSHOT_MS);
-        document.addEventListener("visibilitychange", onHide);
+        document.addEventListener("visibilitychange", onVisibility);
         window.addEventListener("pagehide", () => saveSnapshot(true));
         lastFrame = performance.now();
         raf = requestAnimationFrame(frame);
@@ -643,7 +658,7 @@ function App() {
       clearInterval(revealTimer);
       clearInterval(snapshotTimer);
       cancelAnimationFrame(raf);
-      document.removeEventListener("visibilitychange", onHide);
+      document.removeEventListener("visibilitychange", onVisibility);
       Engine.clear(engine);
     };
   }, []);
