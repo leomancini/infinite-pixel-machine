@@ -54,6 +54,9 @@ export function normalizeItem(raw) {
     background,
     name: String(raw.name || "something").slice(0, 60),
     note: String(raw.note || "")
+      .replace(/[^\x20-\x7E\u00A0-\u024F\u2010-\u2027]+/g, "") // the display font covers Latin only
+      .replace(/\s{2,}/g, " ")
+      .replace(/\s+([,.;:!?])/g, "$1")
       .trim()
       .replace(/^(a|an|the)\s+/i, "")
       .replace(/^[a-z]/, (c) => c.toUpperCase())
