@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { MAX_SPRITE, CELL, STAGE_WIDTH, normalizeItem } from "./shared/canvas.js";
+import { randomCreature } from "./shanhaijing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -22,7 +23,32 @@ const PRUNE_EVERY_MS = 60 * 60_000;
 const CONTEXT_FOR_MODEL = 40; // recent items described to the model
 const TIME_ZONE = "America/New_York";
 const DISPLAY_KEY = process.env.DISPLAY_KEY || "";
-const DISPLAY_IDLE_MS = 30_000; // pause generation this long after the last visible display was heard from
+const DISPLAY_IDLE_MS = 30_000;
+
+// Inspiration sources. The display can restrict these with ?types=a,b.
+const SOURCE_TYPES = {
+  sky: "the real NYC sky color",
+  weather: "the weather",
+  plants: "what is blooming",
+  holidays: "today's weird holiday",
+  events: "a historical event from this date",
+  market: "the subject of a prediction market",
+  creature: "a creature from the Classic of Mountains and Seas",
+};
+const ALL_TYPES = Object.keys(SOURCE_TYPES);
+let activeTypes = ALL_TYPES.slice();
+function setActiveTypes(spec) {
+  if (spec === undefined) return;
+  const wanted = String(spec)
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => ALL_TYPES.includes(t));
+  const next = wanted.length ? wanted : ALL_TYPES.slice();
+  if (next.join() === activeTypes.join()) return;
+  activeTypes = next;
+  console.log(`Inspiration types set to: ${activeTypes.join(", ")}`);
+}
+const typeOn = (t) => activeTypes.includes(t); // pause generation this long after the last visible display was heard from
 if (!DISPLAY_KEY) console.warn("DISPLAY_KEY is not set; every display request will be refused");
 
 const anthropic = new Anthropic({ timeout: 90_000, maxRetries: 1 });
@@ -176,6 +202,7 @@ async function gatherContext() {
           location: weather.location?.name,
         }
       : null,
+    creature: randomCreature(),
     market:
       market && market.question
         ? {
@@ -193,6 +220,9 @@ async function gatherContext() {
 // ---------------------------------------------------------------------------
 
 const ItemSchema = z.object({
+  source: z
+    .enum(ALL_TYPES)
+    .describe("Which inspiration source this thing comes from."),
   name: z.string().describe("Short name for the thing you are adding, 1-4 words."),
   note: z
     .string()
@@ -219,15 +249,15 @@ const ItemSchema = z.object({
     ),
 });
 
-const SYSTEM_PROMPT = `You are the Infinite Pixel Machine: a pixel artist feeding an endless machine on a tall portrait screen.
+const buildSystemPrompt = () => `You are the Infinite Pixel Machine: a pixel artist feeding an endless machine on a tall portrait screen.
 
 How the machine works: each thing you draw becomes a solid physical object. It drops in from the top of the screen, tumbles down with real gravity, and lands on the growing heap of everything drawn before it. The heap never stops growing; the camera slowly drifts upward to keep the top of the heap in view, and older things sink out of sight below. The screen is 768 pixels wide; each cell of your sprite is a ${CELL}px pixel, so a 60-cell-wide sprite is about 40% of the screen width.
 
-Every turn you receive the current time in Brooklyn, New York, live context about the day (sky color, weather, plants in bloom, weird holidays, historical events, and one random prediction market with its current odds), and a list of what has recently landed on the heap. Your job each turn: add exactly ONE new thing, drawn as detailed pixel art, and choose a background color for the screen that the whole scene slowly fades to.
+Every turn you receive the current time in Brooklyn, New York, live context about the day (sky color, weather, plants in bloom, weird holidays, historical events, one random prediction market with its current odds, and one creature from the Classic of Mountains and Seas, the ancient Chinese bestiary), and a list of what has recently landed on the heap. Your job each turn: add exactly ONE new thing, drawn as detailed pixel art, and choose a background color for the screen that the whole scene slowly fades to.
 
 What to draw:
 - One thing per turn: a single object, creature, plant, food, symbol, word, building, vehicle, tool, or curious artifact. Not a scene.
-- Draw things that respond to the moment: the time of day, the weather, the sky color, what is blooming, the holiday, a historical event, or the prediction market. For the market, draw the subject itself: the place, person, team, company, product, animal, event or object the question is about, rendered as a cute sprite (a landmark of the country, a rocket for a launch, a ballot box for an election, a mascot, a trophy). The odds are background flavor at most; do not draw gauges, dials, coins or symbols of probability. The caption must never mention the market, odds, chances, bets, trading or percentages: write about the subject as if it were simply in the news (for example "Husky pup, because Alaska votes for Senate soon"). Vary which source you draw from; do not always pick the same one.
+- Draw things that respond to the moment, choosing from these sources: the time of day, ${activeTypes.map((t) => SOURCE_TYPES[t]).join(", ")}. Set "source" to the one you used. When you choose the creature, draw it faithfully to its description (the right number of heads, legs, wings, tails and eyes, its colors and markings) but as a cute, chubby game sprite, and name it in the caption with its Chinese name, e.g. "Bifang 毕方, the one-legged fire crane of the Mountains and Seas". For the market, draw the subject itself: the place, person, team, company, product, animal, event or object the question is about, rendered as a cute sprite (a landmark of the country, a rocket for a launch, a ballot box for an election, a mascot, a trophy). The odds are background flavor at most; do not draw gauges, dials, coins or symbols of probability. The caption must never mention the market, odds, chances, bets, trading or percentages: write about the subject as if it were simply in the news (for example "Husky pup, because Alaska votes for Senate soon"). Vary which source you draw from; do not always pick the same one. Over time the mix should be roughly even across the sources, with the Shanhaijing creature showing up about one turn in five, so if the recent list leans on one source, pick a different one now.
 - Think about the heap. Vary size, weight and shape so the pile stays interesting: a heavy block one turn, something small and round the next, something long the next. Avoid repeating the names or ideas of recent additions.
 - Use the actual sky color from the context when painting sky-lit surfaces or glowing things.
 
@@ -269,30 +299,35 @@ function describeHeap() {
 function describeContext(ctx) {
   const parts = [];
   parts.push(`Current time: ${ctx.time}`);
-  if (ctx.weather) {
+  if (ctx.weather && typeOn("weather")) {
     parts.push(
       `Weather in ${ctx.weather.location || "Brooklyn"}: ${ctx.weather.condition}, ${ctx.weather.period} (theme: ${ctx.weather.theme})`,
     );
   }
-  if (ctx.skyColors) {
+  if (ctx.skyColors && typeOn("sky")) {
     parts.push(
       `Actual NYC sky colors right now: ${Object.entries(ctx.skyColors)
         .map(([k, v]) => `${k} ${v}`)
         .join(", ")}`,
     );
   }
-  if (ctx.plants?.length) {
+  if (ctx.plants?.length && typeOn("plants")) {
     parts.push(
       `Blooming now: ${ctx.plants.map((p) => `${p.name} (${(p.colors || []).join("/")})`).join("; ")}`,
     );
   }
-  if (ctx.holidays?.length) {
+  if (ctx.holidays?.length && typeOn("holidays")) {
     parts.push(`Today's weird holidays: ${ctx.holidays.map((h) => `${h.name} - ${h.note}`).join(" | ")}`);
   }
-  if (ctx.events?.length) {
+  if (ctx.events?.length && typeOn("events")) {
     parts.push(`On this day in history: ${ctx.events.map((e) => `${e.year}: ${e.title}`).join(" | ")}`);
   }
-  if (ctx.market) {
+  if (ctx.creature && typeOn("creature")) {
+    parts.push(
+      `A creature from the Classic of Mountains and Seas (山海经): ${ctx.creature.name} (${ctx.creature.chinese}), ${ctx.creature.about}.`,
+    );
+  }
+  if (ctx.market && typeOn("market")) {
     const pct = ctx.market.probability === null ? "unknown" : `${Math.round(ctx.market.probability * 100)}%`;
     parts.push(
       `A topic people are currently speculating about: "${ctx.market.question}" (possible outcome: "${ctx.market.prediction}", currently ${pct}). Treat the subject as inspiration, not the number, and never mention markets, odds or percentages in the caption.`,
@@ -321,7 +356,7 @@ async function askForNextItem(ctx) {
     thinking: { type: "between_tools" },
     output_config: { effort: "low", format: zodOutputFormat(ItemSchema) },
     // The system prompt never changes between turns, so cache it.
-    system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+    system: [{ type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } }],
     messages: [{ role: "user", content: userMessage }],
   });
 
@@ -363,7 +398,7 @@ async function runTurn() {
     lastError = null;
     lastTurnAt = turn.createdAt;
     console.log(
-      `#${turn.id} "${item.name}" ${item.w}x${item.h} [in ${usage.input_tokens} cached ${usage.cache_read_input_tokens || 0} out ${usage.output_tokens}, ${((Date.now() - started) / 1000).toFixed(1)}s, ${inFlight} in flight]`,
+      `#${turn.id} "${item.name}" (${item.source}) ${item.w}x${item.h} [in ${usage.input_tokens} cached ${usage.cache_read_input_tokens || 0} out ${usage.output_tokens}, ${((Date.now() - started) / 1000).toFixed(1)}s, ${inFlight} in flight]`,
     );
   } catch (err) {
     lastError = { at: new Date().toISOString(), message: err.message };
@@ -459,6 +494,7 @@ function hydrateSnapshot(snap) {
 // Full state for a fresh display: the saved pile plus any turns since then.
 app.get("/api/state", (req, res) => {
   if (req.query.speed !== undefined) setTurnInterval(req.query.speed);
+  if (req.query.types !== undefined) setActiveTypes(req.query.types);
   if (req.query.active === "1") noteDisplayActive();
   const since = snapshot?.latestTurnId || 0;
   res.json({
@@ -493,6 +529,7 @@ app.post("/api/snapshot", (req, res) => {
     return res.status(409).json({ error: "stale display; reload" });
   }
   if (body.speed !== undefined) setTurnInterval(body.speed);
+  if (body.types !== undefined) setActiveTypes(body.types);
   snapshot = {
     savedAt: new Date().toISOString(),
     latestTurnId: body.latestTurnId,
@@ -518,6 +555,7 @@ app.get("/api/status", (req, res) => {
     lastError,
     inFlight,
     turnIntervalMs,
+    activeTypes,
     displayActive: displayActive(),
     snapshot: snapshot
       ? { savedAt: snapshot.savedAt, latestTurnId: snapshot.latestTurnId, bodies: snapshot.bodies.length }

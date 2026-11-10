@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 import Matter from "matter-js";
 import { STAGE_WIDTH, STAGE_HEIGHT, CELL } from "../shared/canvas.js";
-import { makeBody, drawBody } from "./pile.js";
+import { makeBody, drawBody, renderSprite } from "./pile.js";
 
 const { Engine, Composite, Bodies, Body } = Matter;
 
@@ -12,6 +12,39 @@ const DEFAULT_SPEED_S = 15; // seconds between drops; override with ?speed=N
 // Display key from the URL (?key=...). Required by every API call.
 const DISPLAY_KEY = new URLSearchParams(window.location.search).get("key") || "";
 const api = (path) => `${path}${path.includes("?") ? "&" : "?"}key=${encodeURIComponent(DISPLAY_KEY)}`;
+
+// Browser-tab icon: the latest sprite, fit into a square with nearest-neighbour
+// scaling. Only when the URL has ?favicon=true.
+const FAVICON_SIZE = 64;
+const FAVICON_ENABLED = new URLSearchParams(window.location.search).get("favicon") === "true";
+function setFavicon(item) {
+  if (!FAVICON_ENABLED) return;
+  try {
+    const sprite = renderSprite(item); // one pixel per cell
+    const scale = Math.max(1, Math.floor(FAVICON_SIZE / Math.max(item.w, item.h)));
+    const canvas = document.createElement("canvas");
+    canvas.width = FAVICON_SIZE;
+    canvas.height = FAVICON_SIZE;
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    const w = item.w * scale;
+    const h = item.h * scale;
+    ctx.drawImage(sprite, Math.floor((FAVICON_SIZE - w) / 2), Math.floor((FAVICON_SIZE - h) / 2), w, h);
+    let link = document.querySelector('link[rel="icon"]');
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    link.type = "image/png";
+    link.href = canvas.toDataURL("image/png");
+  } catch (err) {
+    console.warn("favicon failed", err);
+  }
+}
+
+// Inspiration types from the URL, e.g. /?types=creature,holidays. Empty means all.
+const TYPES = new URLSearchParams(window.location.search).get("types") || "";
 
 // Seconds between drops from the URL, e.g. /?speed=5. Falls back to the default.
 function speedFromUrl() {
@@ -369,6 +402,7 @@ function App() {
       drop(turn);
       showCaption(turn);
       setBackground(turn.item);
+      setFavicon(turn.item);
       compactTurns();
     };
 
@@ -412,6 +446,7 @@ function App() {
     const snapshotPayload = () => ({
       epoch,
       speed: intervalMs / 1000,
+      types: TYPES,
       latestTurnId: Math.max(shown > 0 ? turns[shown - 1].id : 0, ...[...pieces.keys()]),
       cameraY,
       background: `#${targetBg.map((c) => Math.round(c).toString(16).padStart(2, "0")).join("")}`,
@@ -698,7 +733,9 @@ function App() {
     const init = async () => {
       try {
         // Tell the server our drop speed so it generates at the same pace.
-        const res = await fetch(api(`/api/state?speed=${intervalMs / 1000}&active=${visible() ? 1 : 0}`));
+        const res = await fetch(
+          api(`/api/state?speed=${intervalMs / 1000}&types=${encodeURIComponent(TYPES)}&active=${visible() ? 1 : 0}`),
+        );
         if (res.status === 401) {
           setNoKey(true);
           return;
@@ -737,7 +774,11 @@ function App() {
         shown = catchUpTo;
         if (shown > 0) {
           setBackground(turns[shown - 1].item);
+          setFavicon(turns[shown - 1].item);
           bg = targetBg.slice();
+        } else if (state.snapshot?.bodies?.length) {
+          const last = state.snapshot.bodies.reduce((a, b) => (b.turnId > a.turnId ? b : a));
+          if (last.item) setFavicon(last.item);
         } else if (state.snapshot?.background) {
           targetBg = hexToRgb(state.snapshot.background);
           bg = targetBg.slice();

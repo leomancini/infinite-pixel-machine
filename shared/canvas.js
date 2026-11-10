@@ -50,6 +50,7 @@ export function normalizeItem(raw) {
       : "#000000";
 
   return {
+    source: typeof raw.source === "string" ? raw.source : null,
     background,
     name: String(raw.name || "something").slice(0, 60),
     note: String(raw.note || "")
