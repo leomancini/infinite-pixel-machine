@@ -54,6 +54,10 @@ function speedFromUrl() {
 }
 const POLL_MS = 5_000;
 const SNAPSHOT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 10_000; // polls and snapshot saves give up after this long
+const STATE_TIMEOUT_MS = 30_000; // the initial state can carry the whole saved heap
+// Abort a fetch that takes too long (skipped on browsers without AbortSignal.timeout).
+const timeoutSignal = (ms) => (AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined);
 const CAMERA_MIN_SPEED = 1; // px per second: the view is always drifting up at least this fast
 const CAMERA_START_ZONE = 160; // px below the middle where the drift begins ramping up from zero
 const CAMERA_MAX_SPEED = 6; // px per second cap when catching up to a tall heap
@@ -326,6 +330,16 @@ function App() {
     Composite.add(world, [floor, leftWall, rightWall]);
 
     let cameraY = 0; // world y at the top of the screen; only ever decreases
+
+    // The camera climbs forever, so the walls are re-centred on it now and
+    // then; they always reach far past everything still in the world.
+    const WALL_FOLLOW_STEP = 10_000;
+    const followWalls = () => {
+      const y = cameraY + STAGE_HEIGHT / 2;
+      if (Math.abs(leftWall.position.y - y) < WALL_FOLLOW_STEP) return;
+      Body.setPosition(leftWall, { x: leftWall.position.x, y });
+      Body.setPosition(rightWall, { x: rightWall.position.x, y });
+    };
     let bg = [0, 0, 0]; // current background color, eased toward targetBg
     let targetBg = [0, 0, 0];
     const pieces = new Map(); // turnId -> body
@@ -416,10 +430,12 @@ function App() {
 
     const visible = () => document.visibilityState === "visible";
 
-    const poll = async () => {
+    const pollOnce = async () => {
       if (!visible()) return; // a hidden tab neither fetches nor keeps the server generating
       try {
-        const res = await fetch(api(`/api/turns?after=${lastKnownId}&active=1`));
+        const res = await fetch(api(`/api/turns?after=${lastKnownId}&active=1`), {
+          signal: timeoutSignal(FETCH_TIMEOUT_MS),
+        });
         if (res.status === 401) {
           setNoKey(true);
           return;
@@ -441,6 +457,16 @@ function App() {
         console.warn("poll failed", err);
       }
     };
+    // One poll at a time: a slow response is shared rather than stacked.
+    let pollInFlight = null;
+    const poll = () => {
+      if (!pollInFlight) {
+        pollInFlight = pollOnce().finally(() => {
+          pollInFlight = null;
+        });
+      }
+      return pollInFlight;
+    };
 
     // --- persistence ---------------------------------------------------------
     const snapshotPayload = () => ({
@@ -461,21 +487,28 @@ function App() {
       })),
     });
 
+    let snapshotInFlight = false; // periodic saves skip a beat rather than stack up
     const saveSnapshot = (useBeacon = false) => {
       if (shown === 0 && pieces.size === 0) return;
+      if (!useBeacon && snapshotInFlight) return;
       const json = JSON.stringify(snapshotPayload());
       if (useBeacon && navigator.sendBeacon) {
         navigator.sendBeacon(api("/api/snapshot"), new Blob([json], { type: "application/json" }));
       } else {
+        snapshotInFlight = true;
         fetch(api("/api/snapshot"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: json,
+          signal: timeoutSignal(FETCH_TIMEOUT_MS),
         })
           .then((res) => {
             if (!res.ok) console.warn("snapshot rejected", res.status);
           })
-          .catch((err) => console.warn("snapshot failed", err));
+          .catch((err) => console.warn("snapshot failed", err))
+          .finally(() => {
+            snapshotInFlight = false;
+          });
       }
     };
     const onVisibility = () => {
@@ -678,6 +711,7 @@ function App() {
       const gap = Math.max(0, cameraY - target);
       const speed = Math.max(minSpeed, Math.min(CAMERA_MAX_SPEED, gap * CAMERA_GAIN));
       cameraY -= speed * dt;
+      followWalls();
 
       // Freeze resting bodies that have scrolled off the bottom; drop ones far below.
       const bottom = cameraY + STAGE_HEIGHT;
@@ -735,6 +769,7 @@ function App() {
         // Tell the server our drop speed so it generates at the same pace.
         const res = await fetch(
           api(`/api/state?speed=${intervalMs / 1000}&types=${encodeURIComponent(TYPES)}&active=${visible() ? 1 : 0}`),
+          { signal: timeoutSignal(STATE_TIMEOUT_MS) },
         );
         if (res.status === 401) {
           setNoKey(true);
@@ -748,6 +783,7 @@ function App() {
         // Restore the saved heap.
         if (state.snapshot) {
           cameraY = Math.min(0, Number(state.snapshot.cameraY) || 0);
+          followWalls(); // before any restored body can move
           for (const b of state.snapshot.bodies) {
             addPiece({ id: b.turnId, item: b.item }, b.x, b.y, { angle: b.angle, isStatic: !!b.isStatic });
           }

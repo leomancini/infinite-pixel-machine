@@ -119,18 +119,27 @@ function saveTurn(item, context) {
 
 // Drop old rows the display can never need again: anything older than the
 // last DB_KEEP_TURNS that the saved pile doesn't reference.
+let pruning = false;
 function pruneDb() {
-  const latest = recent.length ? recent[recent.length - 1].id : 0;
-  const cutoff = latest - DB_KEEP_TURNS;
-  if (cutoff <= 0) return;
-  const keep = new Set((snapshot?.bodies || []).map((b) => b.turnId));
-  const candidates = db.prepare("SELECT id FROM turns WHERE id < ?").all(cutoff).map((r) => r.id);
-  const doomed = candidates.filter((id) => !keep.has(id));
-  if (doomed.length === 0) return;
-  const del = db.prepare("DELETE FROM turns WHERE id = ?");
-  db.transaction(() => doomed.forEach((id) => del.run(id)))();
-  db.pragma("wal_checkpoint(TRUNCATE)");
-  console.log(`Pruned ${doomed.length} old turns from the database`);
+  if (pruning) return;
+  pruning = true;
+  try {
+    const latest = recent.length ? recent[recent.length - 1].id : 0;
+    const cutoff = latest - DB_KEEP_TURNS;
+    if (cutoff <= 0) return;
+    const keep = new Set((snapshot?.bodies || []).map((b) => b.turnId));
+    const candidates = db.prepare("SELECT id FROM turns WHERE id < ?").all(cutoff).map((r) => r.id);
+    const doomed = candidates.filter((id) => !keep.has(id));
+    if (doomed.length === 0) return;
+    const del = db.prepare("DELETE FROM turns WHERE id = ?");
+    db.transaction(() => doomed.forEach((id) => del.run(id)))();
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    console.log(`Pruned ${doomed.length} old turns from the database`);
+  } catch (err) {
+    console.error("Pruning the database failed:", err.message);
+  } finally {
+    pruning = false;
+  }
 }
 setInterval(pruneDb, PRUNE_EVERY_MS).unref();
 
@@ -491,10 +500,17 @@ function hydrateSnapshot(snap) {
   return { ...snap, bodies };
 }
 
+// Speed and types are set by a display when it loads (/api/state). Snapshots
+// carry them too, but only the first one after a server restart is applied
+// (to restore them); otherwise two displays with different settings would
+// flip them back and forth with every snapshot.
+let settingsReceived = false;
+
 // Full state for a fresh display: the saved pile plus any turns since then.
 app.get("/api/state", (req, res) => {
   if (req.query.speed !== undefined) setTurnInterval(req.query.speed);
   if (req.query.types !== undefined) setActiveTypes(req.query.types);
+  if (req.query.speed !== undefined || req.query.types !== undefined) settingsReceived = true;
   if (req.query.active === "1") noteDisplayActive();
   const since = snapshot?.latestTurnId || 0;
   res.json({
@@ -528,8 +544,11 @@ app.post("/api/snapshot", (req, res) => {
     console.warn(`Rejected snapshot from a display with stale epoch ${body.epoch}`);
     return res.status(409).json({ error: "stale display; reload" });
   }
-  if (body.speed !== undefined) setTurnInterval(body.speed);
-  if (body.types !== undefined) setActiveTypes(body.types);
+  if (!settingsReceived) {
+    settingsReceived = true;
+    if (body.speed !== undefined) setTurnInterval(body.speed);
+    if (body.types !== undefined) setActiveTypes(body.types);
+  }
   snapshot = {
     savedAt: new Date().toISOString(),
     latestTurnId: body.latestTurnId,
@@ -538,9 +557,6 @@ app.post("/api/snapshot", (req, res) => {
     bodies: body.bodies.slice(0, 2000),
   };
   setMeta("snapshot", snapshot);
-  console.log(
-    `Snapshot saved: ${snapshot.bodies.length} bodies, through #${snapshot.latestTurnId}, camera ${snapshot.cameraY.toFixed(0)}`,
-  );
   res.json({ ok: true, bodies: snapshot.bodies.length });
 });
 
