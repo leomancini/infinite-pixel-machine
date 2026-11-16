@@ -798,7 +798,13 @@ function App() {
           const demo = (await import("./demo.json")).default;
           if (cancelled) return;
           demoItems = demo.items;
-          reveal(); // the first thing drops right away
+          // Start from the saved heap: the same pieces in the same places
+          // every time, already filling the screen up to the heap line.
+          const art = demo.items.concat(demo.extras || []);
+          for (const p of demo.pile || []) {
+            addPiece({ id: ++lastKnownId, item: art[p.item] }, p.x, p.y, { angle: p.angle });
+          }
+          reveal(); // the first new thing drops right away
           bg = targetBg.slice();
           revealTimer = setInterval(reveal, intervalMs);
           document.addEventListener("visibilitychange", onVisibility);
