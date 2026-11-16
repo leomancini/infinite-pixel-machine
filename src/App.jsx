@@ -11,6 +11,9 @@ const DEFAULT_SPEED_S = 15; // seconds between drops; override with ?speed=N
 
 // Display key from the URL (?key=...). Required by every API call.
 const DISPLAY_KEY = new URLSearchParams(window.location.search).get("key") || "";
+// ?key=DEMO plays a saved set of things (src/demo.json) in a shuffled, endless
+// loop. It never talks to the server, so nothing is generated or saved.
+const DEMO = DISPLAY_KEY === "DEMO";
 const api = (path) => `${path}${path.includes("?") ? "&" : "?"}key=${encodeURIComponent(DISPLAY_KEY)}`;
 
 // Browser-tab icon: the latest sprite, fit into a square with nearest-neighbour
@@ -408,9 +411,27 @@ function App() {
       if (item?.background) targetBg = hexToRgb(item.background);
     };
 
+    // Demo mode: keep the queue topped up with the saved items, reshuffled on
+    // every pass, never starting a pass with the item that ended the last one.
+    let demoItems = [];
+    let demoLast = null;
+    const refillDemo = () => {
+      if (turns.length - shown > 1 || demoItems.length === 0) return;
+      const batch = demoItems.slice();
+      for (let i = batch.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [batch[i], batch[j]] = [batch[j], batch[i]];
+      }
+      const end = batch.length - 1;
+      if (end > 0 && batch[0] === demoLast) [batch[0], batch[end]] = [batch[end], batch[0]];
+      demoLast = batch[end];
+      for (const item of batch) turns.push({ id: ++lastKnownId, item });
+    };
+
     const reveal = () => {
       nextRevealAt = Date.now() + intervalMs;
       if (!visible()) return;
+      if (DEMO) refillDemo();
       if (shown >= turns.length) return;
       const turn = turns[shown++];
       drop(turn);
@@ -513,7 +534,13 @@ function App() {
     };
     const onVisibility = () => {
       if (document.visibilityState === "hidden") {
-        saveSnapshot(true);
+        if (!DEMO) saveSnapshot(true);
+        return;
+      }
+      if (DEMO) {
+        nextRevealAt = Date.now() + intervalMs;
+        captionText = "";
+        lastFrame = performance.now();
         return;
       }
       // Coming back: skip anything that queued up while we were away, so the
@@ -766,6 +793,19 @@ function App() {
     // --- startup -------------------------------------------------------------
     const init = async () => {
       try {
+        if (DEMO) {
+          // Loaded on demand so the saved art stays out of the main bundle.
+          const demo = (await import("./demo.json")).default;
+          if (cancelled) return;
+          demoItems = demo.items;
+          reveal(); // the first thing drops right away
+          bg = targetBg.slice();
+          revealTimer = setInterval(reveal, intervalMs);
+          document.addEventListener("visibilitychange", onVisibility);
+          lastFrame = performance.now();
+          raf = requestAnimationFrame(frame);
+          return;
+        }
         // Tell the server our drop speed so it generates at the same pace.
         const res = await fetch(
           api(`/api/state?speed=${intervalMs / 1000}&types=${encodeURIComponent(TYPES)}&active=${visible() ? 1 : 0}`),
