@@ -13,14 +13,18 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PORT = 3133;
 const MODEL = "claude-sonnet-5-5";
-const DEFAULT_TURN_INTERVAL_MS = 15_000;
+const DEFAULT_TURN_INTERVAL_MS = 30_000;
 const MIN_TURN_INTERVAL_MS = 3_000;
 const MAX_TURN_INTERVAL_MS = 600_000;
 let turnIntervalMs = DEFAULT_TURN_INTERVAL_MS; // the display sets this via ?speed=
 const RECENT_KEEP = 300; // turns kept in memory for the API
 const DB_KEEP_TURNS = 2000; // older turns are pruned from SQLite unless the saved pile still references them
 const PRUNE_EVERY_MS = 60 * 60_000;
-const CONTEXT_FOR_MODEL = 40; // recent items described to the model
+// Recent items described to the model: a stable block of up to HEAP_STABLE
+// that only advances every HEAP_CHUNK turns (so it can be prompt-cached),
+// plus the 0 to HEAP_CHUNK-1 items that landed since. 30 to 39 in total.
+const HEAP_STABLE = 30;
+const HEAP_CHUNK = 10;
 const TIME_ZONE = "America/New_York";
 const DISPLAY_KEY = process.env.DISPLAY_KEY || "";
 const DISPLAY_IDLE_MS = 30_000;
@@ -282,16 +286,37 @@ How to draw (this matters most):
 - Because it becomes a physical object, give it one solid connected shape with a clean silhouette. No separate floating pieces (sparkles must touch the body), no cast shadow or ground under it, no thin one-cell strands sticking far out.
 - Every row string must have the same length (the sprite's width). Use '.' for transparent cells. Every non-'.' character you use must appear in palette with a hex color; use single letters, digits and punctuation as characters (never '.').`;
 
+const heapLine = (t) => `- #${t.id} "${t.item.name}" (${t.item.w}x${t.item.h} cells): ${t.item.note}`;
+
+// The heap list is split in two so most of it can be served from the prompt
+// cache. Caching is a prefix match, so a window that slides by one item every
+// turn would never hit. Instead the older part only moves forward every
+// HEAP_CHUNK turns (its text is byte-identical in between), and everything
+// that changes each turn goes in the tail after it.
 function describeHeap() {
+  const latestId = recent.length ? recent[recent.length - 1].id : 0;
+  const boundary = Math.floor(latestId / HEAP_CHUNK) * HEAP_CHUNK;
+  const older = recent.filter((t) => t.id <= boundary && t.id > boundary - HEAP_STABLE);
+  const newer = recent.filter((t) => t.id > boundary);
+
+  const stable = older.length
+    ? ["THE HEAP", "Things that landed on the heap earlier, oldest first:", ...older.map(heapLine)].join("\n")
+    : null;
+
   const lines = [];
-  lines.push(`Things dropped into the machine so far: ${totalItems}.`);
+  if (!stable) lines.push("THE HEAP");
   if (recent.length === 0) {
     lines.push("The heap is empty. Yours will be the very first thing to land.");
   } else {
-    const shown = recent.slice(-CONTEXT_FOR_MODEL);
-    lines.push(`The most recent ${shown.length}, oldest first (the last ones are on top of the heap):`);
-    for (const t of shown) {
-      lines.push(`- #${t.id} "${t.item.name}" (${t.item.w}x${t.item.h} cells): ${t.item.note}`);
+    if (newer.length) {
+      lines.push(
+        stable
+          ? "The newest things, oldest first (the last ones are on top of the heap):"
+          : "Everything on the heap, oldest first (the last ones are on top of the heap):",
+      );
+      lines.push(...newer.map(heapLine));
+    } else {
+      lines.push("Nothing has landed since; the last thing listed above is on top of the heap.");
     }
     const recentBgs = recent
       .slice(-6)
@@ -302,8 +327,14 @@ function describeHeap() {
       lines.push(`Recent background colors, oldest first (pick something noticeably different): ${recentBgs.join(", ")}`);
     }
   }
-  return lines.join("\n");
+  lines.push("");
+  lines.push(`Things dropped into the machine so far: ${totalItems}.`);
+  return { stable, tail: lines.join("\n") };
 }
+
+// Cache entries live 5 minutes by default, refreshed on every hit. When the
+// display runs slower than that, use the 1-hour TTL so turns still hit.
+const cacheControl = () => ({ type: "ephemeral", ttl: turnIntervalMs >= 4 * MIN ? "1h" : "5m" });
 
 function describeContext(ctx) {
   const parts = [];
@@ -346,27 +377,32 @@ function describeContext(ctx) {
 }
 
 async function askForNextItem(ctx) {
-  const userMessage = [
+  // Order matters for caching: system prompt, then the stable part of the
+  // heap (both cached), then everything that changes every turn.
+  const heap = describeHeap();
+  const volatile = [
+    heap.tail,
+    "",
     "CONTEXT",
     describeContext(ctx),
     "",
-    "THE HEAP",
-    describeHeap(),
-    "",
     "Draw exactly one new cute, game-ready thing to drop into the machine now, as detailed as its size allows.",
   ].join("\n");
+  const content = [];
+  if (heap.stable) content.push({ type: "text", text: heap.stable, cache_control: cacheControl() });
+  content.push({ type: "text", text: volatile });
 
   const response = await anthropic.messages.parse({
     model: MODEL,
     max_tokens: 12000,
     // No extended thinking: the sprite itself is the output, and thinking
-    // pushes turns past the 15s cadence. On Sonnet 5.5 "between_tools" is
+    // slows every turn down. On Sonnet 5.5 "between_tools" is
     // the way to turn thinking off (and "disabled" is rejected).
     thinking: { type: "between_tools" },
     output_config: { effort: "low", format: zodOutputFormat(ItemSchema) },
     // The system prompt never changes between turns, so cache it.
-    system: [{ type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } }],
-    messages: [{ role: "user", content: userMessage }],
+    system: [{ type: "text", text: buildSystemPrompt(), cache_control: cacheControl() }],
+    messages: [{ role: "user", content }],
   });
 
   if (response.stop_reason === "refusal") {
@@ -407,7 +443,7 @@ async function runTurn() {
     lastError = null;
     lastTurnAt = turn.createdAt;
     console.log(
-      `#${turn.id} "${item.name}" (${item.source}) ${item.w}x${item.h} [in ${usage.input_tokens} cached ${usage.cache_read_input_tokens || 0} out ${usage.output_tokens}, ${((Date.now() - started) / 1000).toFixed(1)}s, ${inFlight} in flight]`,
+      `#${turn.id} "${item.name}" (${item.source}) ${item.w}x${item.h} [in ${usage.input_tokens} cache read ${usage.cache_read_input_tokens || 0} write ${usage.cache_creation_input_tokens || 0} out ${usage.output_tokens}, ${((Date.now() - started) / 1000).toFixed(1)}s, ${inFlight} in flight]`,
     );
   } catch (err) {
     lastError = { at: new Date().toISOString(), message: err.message };

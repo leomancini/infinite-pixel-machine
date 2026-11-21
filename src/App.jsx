@@ -7,7 +7,8 @@ import { makeBody, drawBody, renderSprite } from "./pile.js";
 const { Engine, Composite, Bodies, Body } = Matter;
 
 const DISPLAY_LAG = 2; // show results this many turns behind the latest generated
-const DEFAULT_SPEED_S = 15; // seconds between drops; override with ?speed=N
+const LIVE_SPEED_S = 30; // seconds between drops; override with ?speed=N
+const DEMO_SPEED_S = 15; // demo mode makes no API calls, so it can drop faster
 
 // Display key from the URL (?key=...). Required by every API call.
 const DISPLAY_KEY = new URLSearchParams(window.location.search).get("key") || "";
@@ -53,7 +54,7 @@ const TYPES = new URLSearchParams(window.location.search).get("types") || "";
 function speedFromUrl() {
   const raw = new URLSearchParams(window.location.search).get("speed");
   const n = Number(raw);
-  return raw !== null && Number.isFinite(n) && n > 0 ? n : DEFAULT_SPEED_S;
+  return raw !== null && Number.isFinite(n) && n > 0 ? n : DEMO ? DEMO_SPEED_S : LIVE_SPEED_S;
 }
 const POLL_MS = 5_000;
 const SNAPSHOT_MS = 10_000;
