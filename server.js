@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { MAX_SPRITE, CELL, STAGE_WIDTH, normalizeItem } from "./shared/canvas.js";
-import { randomCreature } from "./shanhaijing.js";
+import { randomCreature, relevantCreatures } from "./shanhaijing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +30,9 @@ const DISPLAY_KEY = process.env.DISPLAY_KEY || "";
 const DISPLAY_IDLE_MS = 30_000;
 
 // Inspiration sources. The display can restrict these with ?types=a,b.
+// "creature" is off by default: a Shanhaijing creature is only offered on days
+// when one of its keywords matches the context (see relevantCreatures). With
+// ?types=creature in the list, a random creature is offered every turn.
 const SOURCE_TYPES = {
   time: "the time of day",
   sky: "the real NYC sky color",
@@ -41,14 +44,15 @@ const SOURCE_TYPES = {
   creature: "a creature from the Classic of Mountains and Seas",
 };
 const ALL_TYPES = Object.keys(SOURCE_TYPES);
-let activeTypes = ALL_TYPES.slice();
+const DEFAULT_TYPES = ALL_TYPES.filter((t) => t !== "creature");
+let activeTypes = DEFAULT_TYPES.slice();
 function setActiveTypes(spec) {
   if (spec === undefined) return;
   const wanted = String(spec)
     .split(",")
     .map((t) => t.trim().toLowerCase())
     .filter((t) => ALL_TYPES.includes(t));
-  const next = wanted.length ? wanted : ALL_TYPES.slice();
+  const next = wanted.length ? wanted : DEFAULT_TYPES.slice();
   if (next.join() === activeTypes.join()) return;
   activeTypes = next;
   console.log(`Inspiration types set to: ${activeTypes.join(", ")}`);
@@ -192,7 +196,7 @@ async function gatherContext() {
     minute: "2-digit",
   });
 
-  return {
+  const ctx = {
     time,
     skyColors: sky?.colors || null,
     plants: (plants?.plants || []).slice(0, 6).map((p) => ({
@@ -216,7 +220,6 @@ async function gatherContext() {
           location: weather.location?.name,
         }
       : null,
-    creature: randomCreature(),
     market:
       market && market.question
         ? {
@@ -227,6 +230,41 @@ async function gatherContext() {
           }
         : null,
   };
+  ctx.creature = pickCreature(ctx);
+  return ctx;
+}
+
+const timeOfDay = (hour) =>
+  hour < 5 ? "night" : hour < 8 ? "dawn, sunrise" : hour < 12 ? "morning" : hour < 17 ? "afternoon" : hour < 20 ? "dusk, sunset" : "night";
+
+// Everything known about today, as labelled facts the creature keywords are
+// matched against. Only the active sources count, so a creature can't be
+// justified by a holiday the display has turned off. The season is left out on
+// purpose: it would make the god of autumn "relevant" for three months.
+function dayFacts(ctx) {
+  const hour = new Date(new Date().toLocaleString("en-US", { timeZone: TIME_ZONE })).getHours();
+  const facts = [{ label: `this hour (${timeOfDay(hour)})`, text: timeOfDay(hour) }];
+  if (ctx.weather && typeOn("weather")) {
+    const text = [ctx.weather.condition, ctx.weather.period].filter(Boolean).join(", ");
+    facts.push({ label: `the weather (${text})`, text });
+  }
+  if (typeOn("plants")) for (const p of ctx.plants) facts.push({ label: `the bloom "${p.name}"`, text: p.name });
+  if (typeOn("holidays")) for (const h of ctx.holidays) facts.push({ label: `the holiday "${h.name}"`, text: `${h.name} - ${h.note || ""}` });
+  if (typeOn("events")) for (const e of ctx.events) facts.push({ label: `the event "${e.year}: ${e.title}"`, text: e.title });
+  return facts;
+}
+
+let lastCreatureLog = "";
+function pickCreature(ctx) {
+  // With ?types=creature the old behavior: a random creature every turn.
+  if (typeOn("creature")) return { ...randomCreature(), why: null };
+  const fits = relevantCreatures(dayFacts(ctx));
+  const line = fits.map((c) => `${c.name} (${c.why})`).join("; ") || "none";
+  if (line !== lastCreatureLog) {
+    lastCreatureLog = line;
+    console.log(`Shanhaijing creatures that fit today: ${line}`);
+  }
+  return fits.length ? fits[Math.floor(Math.random() * fits.length)] : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,11 +305,11 @@ const buildSystemPrompt = () => `You are the Infinite Pixel Machine: a pixel art
 
 How the machine works: each thing you draw becomes a solid physical object. It drops in from the top of the screen, tumbles down with real gravity, and lands on the growing heap of everything drawn before it. The heap never stops growing; the camera slowly drifts upward to keep the top of the heap in view, and older things sink out of sight below. The screen is 768 pixels wide; each cell of your sprite is a ${CELL}px pixel, so a 60-cell-wide sprite is about 40% of the screen width.
 
-Every turn you receive the current time in Brooklyn, New York, live context about the day (sky color, weather, plants in bloom, weird holidays, historical events, one random prediction market with its current odds, and one creature from the Classic of Mountains and Seas, the ancient Chinese bestiary), and a list of what has recently landed on the heap. Your job each turn: add exactly ONE new thing, drawn as detailed pixel art, and choose a background color for the screen that the whole scene slowly fades to.
+Every turn you receive the current time in Brooklyn, New York, live context about the day (sky color, weather, plants in bloom, weird holidays, historical events, one random prediction market with its current odds, and now and then a creature from the Classic of Mountains and Seas, the ancient Chinese bestiary), and a list of what has recently landed on the heap. Your job each turn: add exactly ONE new thing, drawn as detailed pixel art, and choose a background color for the screen that the whole scene slowly fades to.
 
 What to draw:
 - One thing per turn: a single object, creature, plant, food, symbol, word, building, vehicle, tool, or curious artifact. Not a scene.
-- Draw things that respond to the moment, choosing from these sources: ${activeTypes.map((t) => SOURCE_TYPES[t]).join(", ")}. Set "source" to the one you used. When you choose the creature, draw it faithfully to its description (the right number of heads, legs, wings, tails and eyes, its colors and markings) but as a cute, chubby game sprite, and name it in the caption by its romanized name only, e.g. "Bifang, the one-legged fire crane of the Mountains and Seas". The display font has no Chinese glyphs, so the caption must contain Latin letters only (no 汉字). For the market, draw the subject itself: the place, person, team, company, product, animal, event or object the question is about, rendered as a cute sprite (a landmark of the country, a rocket for a launch, a ballot box for an election, a mascot, a trophy). The odds are background flavor at most; do not draw gauges, dials, coins or symbols of probability. The caption must never mention the market, odds, chances, bets, trading or percentages: write about the subject as if it were simply in the news (for example "Husky pup, because Alaska votes for Senate soon"). Vary which source you draw from; do not always pick the same one. Over time the mix should be roughly even across the sources, with the Shanhaijing creature showing up about one turn in five, so if the recent list leans on one source, pick a different one now.
+- Draw things that respond to the moment, choosing from these sources: ${activeTypes.map((t) => SOURCE_TYPES[t]).join(", ")}. Set "source" to the one you used.${typeOn("creature") ? "" : " Some turns the context also offers a creature from the Classic of Mountains and Seas, with the reason it fits today; on those turns it counts as one more source (\"creature\"), and the caption must give that reason, e.g. \"Taotie, the glutton beast, hungry for Thanksgiving tomorrow\"."} When you choose the creature, draw it faithfully to its description (the right number of heads, legs, wings, tails and eyes, its colors and markings) but as a cute, chubby game sprite, and name it in the caption by its romanized name only, e.g. "Bifang, the one-legged fire crane of the Mountains and Seas". The display font has no Chinese glyphs, so the caption must contain Latin letters only (no 汉字). For the market, draw the subject itself: the place, person, team, company, product, animal, event or object the question is about, rendered as a cute sprite (a landmark of the country, a rocket for a launch, a ballot box for an election, a mascot, a trophy). The odds are background flavor at most; do not draw gauges, dials, coins or symbols of probability. The caption must never mention the market, odds, chances, bets, trading or percentages: write about the subject as if it were simply in the news (for example "Husky pup, because Alaska votes for Senate soon"). Vary which source you draw from; do not always pick the same one. Over time the mix should be roughly even across the sources${typeOn("creature") ? ", with the Shanhaijing creature showing up about one turn in five" : ""}, so if the recent list leans on one source, pick a different one now.
 - Think about the heap. Vary size, weight and shape so the pile stays interesting: a heavy block one turn, something small and round the next, something long the next. Avoid repeating the names or ideas of recent additions.
 - Use the actual sky color from the context when painting sky-lit surfaces or glowing things.
 
@@ -363,9 +401,12 @@ function describeContext(ctx) {
   if (ctx.events?.length && typeOn("events")) {
     parts.push(`On this day in history: ${ctx.events.map((e) => `${e.year}: ${e.title}`).join(" | ")}`);
   }
-  if (ctx.creature && typeOn("creature")) {
+  if (ctx.creature) {
+    const c = ctx.creature;
     parts.push(
-      `A creature from the Classic of Mountains and Seas (山海经): ${ctx.creature.name} (${ctx.creature.chinese}), ${ctx.creature.about}.`,
+      c.why
+        ? `A creature from the Classic of Mountains and Seas (山海经) that happens to fit today: ${c.name} (${c.chinese}), ${c.about}. Why it fits: ${c.why}. If you draw it, the caption should say why it belongs to today.`
+        : `A creature from the Classic of Mountains and Seas (山海经): ${c.name} (${c.chinese}), ${c.about}.`,
     );
   }
   if (ctx.market && typeOn("market")) {
@@ -609,6 +650,7 @@ app.get("/api/status", (req, res) => {
     inFlight,
     turnIntervalMs,
     activeTypes,
+    creaturesToday: lastCreatureLog || null,
     displayActive: displayActive(),
     snapshot: snapshot
       ? { savedAt: snapshot.savedAt, latestTurnId: snapshot.latestTurnId, bodies: snapshot.bodies.length }

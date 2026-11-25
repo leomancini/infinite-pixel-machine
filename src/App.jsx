@@ -47,7 +47,8 @@ function setFavicon(item) {
   }
 }
 
-// Inspiration types from the URL, e.g. /?types=creature,holidays. Empty means all.
+// Inspiration types from the URL, e.g. /?types=creature,holidays. Empty means the
+// default set (everything but creature, which then only shows up on days it fits).
 const TYPES = new URLSearchParams(window.location.search).get("types") || "";
 
 // Seconds between drops from the URL, e.g. /?speed=5. Falls back to the default.
