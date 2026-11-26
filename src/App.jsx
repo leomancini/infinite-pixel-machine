@@ -51,6 +51,13 @@ function setFavicon(item) {
 // default set (everything but creature, which then only shows up on days it fits).
 const TYPES = new URLSearchParams(window.location.search).get("types") || "";
 
+// Seconds as a countdown clock: 300 -> "5:00", 59 -> "0:59", 3600 -> "60:00".
+function formatClock(totalSeconds) {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 // Seconds between drops from the URL, e.g. /?speed=5. Falls back to the default.
 function speedFromUrl() {
   const raw = new URLSearchParams(window.location.search).get("speed");
@@ -147,6 +154,8 @@ const CAPTION_SIZE = 40;
 const CAPTION_LINE_HEIGHT = 1.25;
 const COUNT_SIZE = 80;
 const DIGIT_CELL_EM = 0.8;
+const COLON_CELL_EM = 0.4;
+const COUNT_GAP = 52; // px between the clock's left edge and the caption's first line
 
 const Countdown = styled.div`
   position: absolute;
@@ -162,11 +171,17 @@ const Countdown = styled.div`
   pointer-events: none;
   display: flex;
 
-  /* Each digit sits in a fixed-width cell so the number never shifts. */
+  font-variant-numeric: tabular-nums;
+
+  /* Each digit sits in a fixed-width cell so the clock never shifts as it
+     counts down; the colon gets a narrower cell of its own. */
   span {
     display: inline-block;
     width: ${DIGIT_CELL_EM}em;
     text-align: center;
+  }
+  span.colon {
+    width: ${COLON_CELL_EM}em;
   }
 `;
 
@@ -185,7 +200,7 @@ const NoKey = styled.div`
 const Caption = styled.div`
   position: absolute;
   left: var(--caption-left, 35px);
-  right: 236px;
+  right: ${TEXT_MARGIN}px;
   top: var(--caption-top, 24px);
   font-family: "Silkscreen", ui-monospace, monospace;
   font-size: ${CAPTION_SIZE}px;
@@ -193,6 +208,16 @@ const Caption = styled.div`
   color: rgba(255, 255, 255, 0.85);
   white-space: pre-wrap;
   pointer-events: none;
+
+  /* The clock sits in the top right corner. Only the lines beside it have to
+     keep clear of it, so float an invisible block of its size there; the
+     lines below get the full width. Its size is measured at runtime. */
+  &::before {
+    content: "";
+    float: right;
+    width: var(--count-clear, 276px);
+    height: var(--count-clear-height, ${COUNT_SIZE}px);
+  }
 `;
 
 // Invisible twin of the caption used to measure where the full text wraps,
@@ -292,6 +317,10 @@ function useOpticalAlign() {
       const inkRight = start + dig.actualBoundingBoxRight;
       root.setProperty("--count-top", `${TEXT_MARGIN - digInkTop}px`);
       root.setProperty("--count-right", `${TEXT_MARGIN - (cell - inkRight)}px`);
+      // How far the clock's ink reaches below the caption's top edge, so the
+      // caption floats around exactly the lines the clock overlaps.
+      const digInkHeight = dig.actualBoundingBoxAscent + dig.actualBoundingBoxDescent;
+      root.setProperty("--count-clear-height", `${Math.ceil(capInkTop + digInkHeight + 4)}px`);
     };
     document.fonts.load(`400 ${COUNT_SIZE}px Silkscreen`).then(apply, apply);
     document.fonts.ready.then(apply);
@@ -767,20 +796,25 @@ function App() {
         updateHud(now);
       }
 
-      // Countdown to the next drop.
+      // Countdown to the next drop, as a clock: 4:59, 4:58 ... 0:00.
       const remaining = Math.max(0, nextRevealAt - Date.now());
       const label = countdownRef.current;
       if (label) {
         const hasNext = shown < turns.length;
-        const digits = String(Math.ceil(remaining / 1000)).padStart(2, "0");
-        if (label.textContent !== digits) {
+        const clock = formatClock(Math.ceil(remaining / 1000));
+        if (label.textContent !== clock) {
+          const cells = [...clock];
           label.replaceChildren(
-            ...[...digits].map((d) => {
+            ...cells.map((c) => {
               const span = document.createElement("span");
-              span.textContent = d;
+              span.textContent = c;
+              if (c === ":") span.className = "colon";
               return span;
             }),
           );
+          // Keep the caption's first line clear of the clock, however many cells it has.
+          const width = cells.reduce((w, c) => w + (c === ":" ? COLON_CELL_EM : DIGIT_CELL_EM), 0) * COUNT_SIZE;
+          document.documentElement.style.setProperty("--count-clear", `${width + COUNT_GAP}px`);
         }
         label.style.opacity = hasNext ? "1" : "0.4";
       }
