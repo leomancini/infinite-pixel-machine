@@ -11,9 +11,14 @@ import { randomCreature, relevantCreatures } from "./shanhaijing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const PORT = 3133;
-const MODEL = "claude-sonnet-5-5";
-const DEFAULT_TURN_INTERVAL_MS = 30_000;
+const PORT = Number(process.env.PORT) || 3133;
+// Sonnet 5.5 draws the sprites. Haiku 5.5 was tried (Nov 2026): without
+// thinking its sprites are visibly cruder, and with thinking it spends so many
+// tokens that it costs as much as Sonnet. MODEL in .env switches it anyway.
+const MODEL = process.env.MODEL || "claude-sonnet-5-5";
+// Sonnet 5.5 rejects "disabled"; "between_tools" is its way to turn thinking off.
+const THINKING = MODEL === "claude-sonnet-5-5" ? { type: "between_tools" } : { type: "disabled" };
+const DEFAULT_TURN_INTERVAL_MS = 300_000;
 const MIN_TURN_INTERVAL_MS = 3_000;
 const MAX_TURN_INTERVAL_MS = 600_000;
 let turnIntervalMs = DEFAULT_TURN_INTERVAL_MS; // the display sets this via ?speed=
@@ -26,6 +31,46 @@ const PRUNE_EVERY_MS = 60 * 60_000;
 const HEAP_STABLE = 30;
 const HEAP_CHUNK = 10;
 const TIME_ZONE = "America/New_York";
+
+// ---------------------------------------------------------------------------
+// Spending controls. Each one can be changed in .env.
+// ---------------------------------------------------------------------------
+const envInt = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return process.env[name] !== undefined && process.env[name] !== "" && Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+};
+// Every RERUN_EVERY-th drop is something drawn earlier that still fits the
+// moment, dropped again for free instead of paying for a new drawing. 0 = off.
+const RERUN_EVERY = envInt("RERUN_EVERY", 2);
+const RERUN_GAP = 60; // a thing can't come back until this many drops after it last landed
+// No new drawings between these hours (New York time), e.g. "1-6" or "23-7".
+// Reruns that fit still drop. Empty = never rest.
+const QUIET_HOURS = (() => {
+  const m = /^(\d{1,2})-(\d{1,2})$/.exec((process.env.QUIET_HOURS ?? "1-6").trim());
+  return m && m[1] !== m[2] && m[1] < 24 && m[2] <= 24 ? [Number(m[1]), Number(m[2]) % 24] : null;
+})();
+// At most this many paid drawings per day. 0 = no cap.
+const DAILY_PAID_CAP = envInt("DAILY_PAID_CAP", 500);
+const MAX_DRAW = 72; // largest sprite the model is asked for (MAX_SPRITE stays the limit for drawing old ones)
+const MAX_TOKENS = 6000; // a full MAX_DRAW sprite is about 3000 output tokens
+// Dollars per million tokens, for the estimate in /api/status.
+const PRICES = {
+  "claude-sonnet-5-5": { input: 2, output: 10, cacheRead: 0.1 },
+  "claude-haiku-5-5": { input: 0.1, output: 0.5, cacheRead: 0.01 },
+};
+
+// The date and hour in New York for a moment in time.
+function nyParts(date = new Date()) {
+  const d = new Date(date.toLocaleString("en-US", { timeZone: TIME_ZONE }));
+  const two = (n) => String(n).padStart(2, "0");
+  return { day: `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`, hour: d.getHours() };
+}
+const inQuietHours = () => {
+  if (!QUIET_HOURS) return false;
+  const [from, to] = QUIET_HOURS;
+  const { hour } = nyParts();
+  return from < to ? hour >= from && hour < to : hour >= from || hour < to;
+};
 const DISPLAY_KEY = process.env.DISPLAY_KEY || "";
 const DISPLAY_IDLE_MS = 30_000;
 
@@ -60,14 +105,16 @@ function setActiveTypes(spec) {
 const typeOn = (t) => activeTypes.includes(t); // pause generation this long after the last visible display was heard from
 if (!DISPLAY_KEY) console.warn("DISPLAY_KEY is not set; every display request will be refused");
 
-const anthropic = new Anthropic({ timeout: 90_000, maxRetries: 1 });
+// No SDK retries: the loop tries again at the next interval anyway, and
+// retrying a request that timed out can pay for the same drawing twice.
+const anthropic = new Anthropic({ timeout: 90_000, maxRetries: 0 });
 const app = express();
 
 // ---------------------------------------------------------------------------
 // Storage
 // ---------------------------------------------------------------------------
 
-const db = new Database(join(__dirname, "data.sqlite"));
+const db = new Database(process.env.DB_PATH || join(__dirname, "data.sqlite"));
 db.pragma("journal_mode = WAL");
 db.exec(`
   CREATE TABLE IF NOT EXISTS turns (
@@ -81,6 +128,10 @@ db.exec(`
     value TEXT NOT NULL
   );
 `);
+// rerun_of: the turn this one replays, or NULL for a new drawing.
+if (!db.prepare("PRAGMA table_info(turns)").all().some((c) => c.name === "rerun_of")) {
+  db.exec("ALTER TABLE turns ADD COLUMN rerun_of INTEGER");
+}
 
 const getMeta = (key) => {
   const row = db.prepare("SELECT value FROM meta WHERE key = ?").get(key);
@@ -113,11 +164,11 @@ if (!epoch) {
   setMeta("epoch", epoch);
 }
 
-function saveTurn(item, context) {
+function saveTurn(item, context, rerunOf = null) {
   const createdAt = new Date().toISOString();
   const result = db
-    .prepare("INSERT INTO turns (created_at, item, context) VALUES (?, ?, ?)")
-    .run(createdAt, JSON.stringify(item), JSON.stringify(context));
+    .prepare("INSERT INTO turns (created_at, item, context, rerun_of) VALUES (?, ?, ?, ?)")
+    .run(createdAt, JSON.stringify(item), JSON.stringify(context), rerunOf);
   const turn = { id: Number(result.lastInsertRowid), createdAt, item };
   recent.push(turn);
   if (recent.length > RECENT_KEEP) recent.splice(0, recent.length - RECENT_KEEP);
@@ -125,6 +176,40 @@ function saveTurn(item, context) {
   setMeta("totalItems", totalItems);
   return turn;
 }
+
+// What today has cost so far. Kept in meta so a restart doesn't reset the
+// daily cap; the last 30 days are kept for /api/status.
+let usage = getMeta("usage");
+function today() {
+  const { day } = nyParts();
+  if (usage?.day === day) return usage;
+  if (usage) setMeta("usageHistory", [...(getMeta("usageHistory") || []), usage].slice(-30));
+  usage = { day, liveCalls: 0, drawn: 0, reruns: 0, failed: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+  setMeta("usage", usage);
+  return usage;
+}
+function count(field, n = 1) {
+  today()[field] += n;
+  setMeta("usage", usage);
+}
+// Add one response's tokens to today's totals.
+function bill(u) {
+  if (!u) return;
+  const t = today();
+  const read = u.cache_read_input_tokens || 0;
+  const write5m = u.cache_creation?.ephemeral_5m_input_tokens ?? u.cache_creation_input_tokens ?? 0;
+  const write1h = u.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+  t.inputTokens += (u.input_tokens || 0) + read + write5m + write1h;
+  t.outputTokens += u.output_tokens || 0;
+  const p = PRICES[MODEL];
+  if (p) {
+    const dollars =
+      ((u.input_tokens || 0) * p.input + read * p.cacheRead + write5m * p.input * 1.25 + write1h * p.input * 2 + (u.output_tokens || 0) * p.output) / 1e6;
+    t.estimatedCost = Math.round((t.estimatedCost + dollars) * 1e5) / 1e5;
+  }
+  setMeta("usage", usage);
+}
+const capReached = () => DAILY_PAID_CAP > 0 && today().liveCalls >= DAILY_PAID_CAP;
 
 // Drop old rows the display can never need again: anything older than the
 // last DB_KEEP_TURNS that the saved pile doesn't reference.
@@ -296,8 +381,9 @@ const ItemSchema = z.object({
     .describe("Characters used in rows mapped to colors. '.' is always transparent."),
   rows: z
     .array(z.string())
+    .min(1) // now and then the model wrote the palette and then no rows at all
     .describe(
-      `The sprite, top to bottom. Each string is one row of cells; each character is one cell. All rows the same length. Use '.' for transparent. Longer side anywhere from 16 to ${MAX_SPRITE} cells; vary it deliberately from turn to turn.`,
+      `The sprite, top to bottom. Each string is one row of cells; each character is one cell. All rows the same length. Use '.' for transparent. Longer side anywhere from 16 to ${MAX_DRAW} cells; vary it deliberately from turn to turn.`,
     ),
 });
 
@@ -321,7 +407,7 @@ How to draw (this matters most):
 - Shading: light from the upper left, soft and simple. One clear shadow side, one clear lit side, a crisp specular highlight dot or two on anything round or shiny, and a little rim light on the shadow edge. Use light dithering sparingly for texture (wood, fabric, fur, grass); never muddy.
 - Charm details: little sparkles, a blush, a shine, a tiny face with dot eyes and a small smile when it suits the subject (a cloud, a fruit, a planet, a sprout), a ribbon or button, a leaf on top. One or two of these per sprite, not all of them.
 - Detail density: pack the sprite with intentional detail at every size, but keep it clean: every pixel cluster should read as something (a petal, a window pane, a stitch, a freckle), not noise.
-- Vary the size deliberately so the heap has rhythm: some turns a small thing of 16 to 28 cells, most turns 36 to 60, and now and then something grand at 72 to ${MAX_SPRITE}. Look at the sizes of the recent things and choose a contrast.
+- Vary the size deliberately so the heap has rhythm: some turns a small thing of 16 to 28 cells, most turns 32 to 52, and about one turn in ten something grand at 60 to ${MAX_DRAW}. Look at the sizes of the recent things and choose a contrast.
 - Because it becomes a physical object, give it one solid connected shape with a clean silhouette. No separate floating pieces (sparkles must touch the body), no cast shadow or ground under it, no thin one-cell strands sticking far out.
 - Every row string must have the same length (the sprite's width). Use '.' for transparent cells. Every non-'.' character you use must appear in palette with a hex color; use single letters, digits and punctuation as characters (never '.').`;
 
@@ -371,9 +457,13 @@ function describeHeap() {
   return { stable, tail: lines.join("\n") };
 }
 
-// Cache entries live 5 minutes by default, refreshed on every hit. When the
-// display runs slower than that, use the 1-hour TTL so turns still hit.
-const cacheControl = () => ({ type: "ephemeral", ttl: turnIntervalMs >= 4 * MIN ? "1h" : "5m" });
+// Cache entries live 5 minutes by default, refreshed on every hit. Reruns make
+// no call, so live calls are further apart than the drops;
+// when the gap gets near 5 minutes use the 1-hour TTL so turns still hit. The
+// system prompt never changes, so it moves to the long TTL sooner than the
+// heap list (which is replaced every HEAP_CHUNK drops anyway).
+const liveGapMs = () => turnIntervalMs * (RERUN_EVERY > 1 ? 2 : 1);
+const cacheControl = (longAfterMs) => ({ type: "ephemeral", ttl: liveGapMs() >= longAfterMs ? "1h" : "5m" });
 
 function describeContext(ctx) {
   const parts = [];
@@ -431,21 +521,21 @@ async function askForNextItem(ctx) {
     "Draw exactly one new cute, game-ready thing to drop into the machine now, as detailed as its size allows.",
   ].join("\n");
   const content = [];
-  if (heap.stable) content.push({ type: "text", text: heap.stable, cache_control: cacheControl() });
+  if (heap.stable) content.push({ type: "text", text: heap.stable, cache_control: cacheControl(4 * MIN) });
   content.push({ type: "text", text: volatile });
 
   const response = await anthropic.messages.parse({
     model: MODEL,
-    max_tokens: 12000,
+    max_tokens: MAX_TOKENS,
     // No extended thinking: the sprite itself is the output, and thinking
-    // slows every turn down. On Sonnet 5.5 "between_tools" is
-    // the way to turn thinking off (and "disabled" is rejected).
-    thinking: { type: "between_tools" },
+    // slows every turn down and multiplies its cost.
+    thinking: THINKING,
     output_config: { effort: "low", format: zodOutputFormat(ItemSchema) },
     // The system prompt never changes between turns, so cache it.
-    system: [{ type: "text", text: buildSystemPrompt(), cache_control: cacheControl() }],
+    system: [{ type: "text", text: buildSystemPrompt(), cache_control: cacheControl(2 * MIN) }],
     messages: [{ role: "user", content }],
   });
+  bill(response.usage);
 
   if (response.stop_reason === "refusal") {
     throw new Error(`Model refused: ${response.stop_details?.explanation || "no explanation"}`);
@@ -457,6 +547,62 @@ async function askForNextItem(ctx) {
     throw new Error("Model output did not match schema");
   }
   return { raw: response.parsed_output, usage: response.usage };
+}
+
+// ---------------------------------------------------------------------------
+// Reruns: things drawn earlier, dropped again for free
+// ---------------------------------------------------------------------------
+
+// Whether something drawn at createdAt would still make sense dropped now.
+// Its caption names the reason it belonged to its moment, so a holiday or an
+// event only comes back the same day, and anything about the light or the
+// weather only in the same part of the same day.
+function stillFits(source, createdAt) {
+  const then = new Date(createdAt);
+  const was = nyParts(then);
+  const now = nyParts();
+  const sameDay = was.day === now.day;
+  switch (source) {
+    case "time":
+    case "sky":
+    case "weather":
+      return sameDay && timeOfDay(was.hour) === timeOfDay(now.hour);
+    case "holidays":
+    case "events":
+      return sameDay;
+    case "plants":
+    case "market":
+      return Date.now() - then.getTime() < 3 * 24 * 60 * MIN;
+    case "creature":
+      return typeOn("creature") || sameDay; // otherwise it was offered for a reason tied to its day
+    default:
+      return false;
+  }
+}
+
+const selectRerunRows = db.prepare(
+  "SELECT id, created_at, rerun_of, json_extract(item, '$.source') AS source FROM turns ORDER BY id DESC LIMIT ?",
+);
+
+// Drop an earlier drawing again. Returns false when nothing suitable exists.
+function dropRerun() {
+  const rows = selectRerunRows.all(DB_KEEP_TURNS);
+  const onTop = new Set(rows.slice(0, RERUN_GAP).map((r) => r.rerun_of ?? r.id));
+  const fits = rows.filter(
+    (r) =>
+      r.rerun_of === null &&
+      !onTop.has(r.id) &&
+      (typeOn(r.source) || r.source === "creature") &&
+      stillFits(r.source, r.created_at),
+  );
+  if (fits.length === 0) return false;
+  const pick = fits[Math.floor(Math.random() * fits.length)];
+  const item = JSON.parse(selectItem.get(pick.id).item);
+  const turn = saveTurn(item, { rerunOf: pick.id }, pick.id);
+  count("reruns");
+  lastTurnAt = turn.createdAt;
+  console.log(`#${turn.id} "${item.name}" (${item.source}) rerun of #${pick.id}, one of ${fits.length} that fit`);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +619,7 @@ async function runTurn() {
   const started = Date.now();
   try {
     const ctx = await gatherContext();
+    count("liveCalls");
     const { raw, usage } = await askForNextItem(ctx);
     const item = normalizeItem(raw);
     if (!item) {
@@ -482,6 +629,7 @@ async function runTurn() {
       );
     }
     const turn = saveTurn(item, ctx);
+    count("drawn");
     lastError = null;
     lastTurnAt = turn.createdAt;
     console.log(
@@ -489,6 +637,7 @@ async function runTurn() {
     );
   } catch (err) {
     lastError = { at: new Date().toISOString(), message: err.message };
+    count("failed");
     console.error(`Turn failed: ${err.message}`);
   } finally {
     inFlight -= 1;
@@ -510,10 +659,12 @@ function noteDisplayActive() {
   }
 }
 
-// Start a turn every turnIntervalMs while a display is active. Turns may
-// overlap (each one only needs the heap as it was when it started), bounded
-// by MAX_IN_FLIGHT.
+// Drop something every turnIntervalMs while a display is active: a rerun or
+// a new live drawing. While resting, every drop is a rerun. Live turns may overlap (each
+// one only needs the heap as it was when it started), bounded by MAX_IN_FLIGHT.
 let loopTimer = null;
+let slot = 0;
+let resting = null; // why no new drawings are being bought right now, if so
 function tick() {
   if (!displayActive()) {
     if (!paused) {
@@ -522,6 +673,14 @@ function tick() {
     }
     return;
   }
+  const why = inQuietHours() ? "quiet hours" : capReached() ? `today's cap of ${DAILY_PAID_CAP} paid drawings is reached` : null;
+  if (why !== resting) {
+    resting = why;
+    console.log(why ? `No new drawings for now: ${why}` : "Drawing again");
+  }
+  slot += 1;
+  if (RERUN_EVERY > 0 && (why || slot % RERUN_EVERY === 0) && dropRerun()) return;
+  if (why) return;
   if (inFlight < MAX_IN_FLIGHT) runTurn();
   else console.warn(`Skipping a turn: ${inFlight} already in flight`);
 }
@@ -652,6 +811,15 @@ app.get("/api/status", (req, res) => {
     activeTypes,
     creaturesToday: lastCreatureLog || null,
     displayActive: displayActive(),
+    resting,
+    spending: {
+      rerunEvery: RERUN_EVERY,
+      quietHours: QUIET_HOURS ? QUIET_HOURS.join("-") : null,
+      dailyPaidCap: DAILY_PAID_CAP,
+      // estimatedCost is in dollars, or meaningless (0) for a model with no entry in PRICES.
+      today: today(),
+      earlierDays: getMeta("usageHistory") || [],
+    },
     snapshot: snapshot
       ? { savedAt: snapshot.savedAt, latestTurnId: snapshot.latestTurnId, bodies: snapshot.bodies.length }
       : null,
