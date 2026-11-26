@@ -7,7 +7,7 @@ import { makeBody, drawBody, renderSprite } from "./pile.js";
 const { Engine, Composite, Bodies, Body } = Matter;
 
 const DISPLAY_LAG = 2; // show results this many turns behind the latest generated
-const LIVE_SPEED_S = 30; // seconds between drops; override with ?speed=N
+const LIVE_SPEED_S = 300; // seconds between drops; override with ?speed=N
 const DEMO_SPEED_S = 15; // demo mode makes no API calls, so it can drop faster
 
 // Display key from the URL (?key=...). Required by every API call.
