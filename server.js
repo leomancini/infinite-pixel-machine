@@ -181,7 +181,7 @@ async function gatherContext() {
     fetchJson("https://today-api.fcc.lol/blooming-plants", 60 * MIN),
     fetchJson("https://today-api.fcc.lol/weird-holidays", 60 * MIN),
     fetchJson("https://today-api.fcc.lol/historical-events", 60 * MIN),
-    fetchJson("https://labs.noshado.ws/weather-theme-key/?location=11249", 10 * MIN),
+    fetchJson("https://labs.noshado.ws/weather-theme-key/?location=11101", 10 * MIN),
     // Returns a different random market on every call, so never cache it.
     fetchJson("https://prediction-markets-research-api.noshado.ws/random", 0),
   ]);
