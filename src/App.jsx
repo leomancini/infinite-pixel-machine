@@ -433,19 +433,21 @@ function App() {
     // --- reveal cadence ------------------------------------------------------
     let captionText = ""; // caption (pre-wrapped) of the last piece dropped
     let upcoming = null; // { turn, text }: the next piece's caption, wrapped ahead of time
-    const wrapNote = (turn) => {
-      const note = turn.item.note || "";
+    let startItem = null; // piece whose caption to show at startup, once the font is in
+    const wrapNote = (item) => {
+      const note = item?.note || "";
       return ghostRef.current ? wrapToLines(ghostRef.current, note) : note;
     };
     const upcomingCaption = () => {
       if (shown >= turns.length) return null;
       const turn = turns[shown];
-      if (upcoming?.turn !== turn) upcoming = { turn, text: wrapNote(turn) };
+      if (upcoming?.turn !== turn) upcoming = { turn, text: wrapNote(turn.item) };
       return upcoming.text;
     };
     const showCaption = (turn) => {
-      captionText = upcoming?.turn === turn ? upcoming.text : wrapNote(turn);
+      captionText = upcoming?.turn === turn ? upcoming.text : wrapNote(turn.item);
       upcoming = null;
+      startItem = null;
     };
 
     const setBackground = (item) => {
@@ -580,7 +582,6 @@ function App() {
       }
       if (DEMO) {
         nextRevealAt = Date.now() + intervalMs;
-        captionText = "";
         lastFrame = performance.now();
         return;
       }
@@ -590,7 +591,6 @@ function App() {
         shown = Math.max(shown, turns.length - DISPLAY_LAG);
         compactTurns();
         nextRevealAt = Date.now() + intervalMs;
-        captionText = "";
         lastFrame = performance.now();
       });
     };
@@ -830,6 +830,12 @@ function App() {
       }
       const caption = captionRef.current;
       if (caption) {
+        // Wrap the startup caption only once the font has loaded and the clock
+        // has set its width, so its line breaks match the real caption box.
+        if (startItem && document.fonts.status === "loaded") {
+          captionText = wrapNote(startItem);
+          startItem = null;
+        }
         // With nothing queued there's no drop coming, so the current caption just stays.
         const nextText = upcomingCaption();
         const next = nextText === null ? captionText : swapCaption(captionText, nextText, remaining, intervalMs);
@@ -904,10 +910,12 @@ function App() {
         if (shown > 0) {
           setBackground(turns[shown - 1].item);
           setFavicon(turns[shown - 1].item);
+          startItem = turns[shown - 1].item;
           bg = targetBg.slice();
         } else if (state.snapshot?.bodies?.length) {
           const last = state.snapshot.bodies.reduce((a, b) => (b.turnId > a.turnId ? b : a));
           if (last.item) setFavicon(last.item);
+          startItem = last.item;
         } else if (state.snapshot?.background) {
           targetBg = hexToRgb(state.snapshot.background);
           bg = targetBg.slice();
