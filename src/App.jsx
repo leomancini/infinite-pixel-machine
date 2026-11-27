@@ -252,21 +252,20 @@ function wrapToLines(ghost, text) {
   return lines.join("\n");
 }
 
-// Caption typewriter, all within one countdown interval: typing starts the
-// moment the countdown resets, holds, then untypes so the text is gone one
-// second before the timer hits 0, leaving a short silence before the next one.
-const END_PAUSE_MS = 1000; // silence at the end of the interval
-const TYPE_FRACTION = 0.3; // fraction of the interval spent typing
-const UNTYPE_FROM = 0.68; // fraction of the interval at which untyping starts
-function visibleChars(text, elapsedMs, intervalMs) {
-  const n = text.length;
-  const typeEnd = TYPE_FRACTION * intervalMs;
-  const untypeEnd = Math.max(intervalMs - END_PAUSE_MS, intervalMs * 0.7);
-  const untypeStart = Math.max(UNTYPE_FROM * intervalMs, typeEnd);
-  if (elapsedMs < typeEnd) return Math.floor((elapsedMs / typeEnd) * n);
-  if (elapsedMs < untypeStart) return n;
-  if (elapsedMs >= untypeEnd) return 0;
-  return Math.ceil((1 - (elapsedMs - untypeStart) / (untypeEnd - untypeStart)) * n);
+// Caption typewriter: the last caption stays up through the countdown. Near
+// the end it untypes, then the next one types in, at one fixed rate per
+// character, timed so the new caption finishes exactly as its piece drops.
+// Longer captions just start sooner.
+const CHAR_MS = 35; // ms per character, untyping and typing alike
+const MIN_LEAD_MS = 500; // never let the swap use more than the interval minus this
+function swapCaption(current, upcoming, remainingMs, intervalMs) {
+  const total = current.length + upcoming.length;
+  if (total === 0) return "";
+  // Only slows down past CHAR_MS when the interval is too short to fit (tiny ?speed).
+  const charMs = Math.min(CHAR_MS, Math.max(1, intervalMs - MIN_LEAD_MS) / total);
+  const done = Math.min(total, Math.max(0, Math.floor((total * charMs - remainingMs) / charMs)));
+  if (done <= current.length) return current.slice(0, current.length - done);
+  return upcoming.slice(0, done - current.length);
 }
 
 // Keep --stage-scale equal to the largest scale at which 768x1024 fits the
@@ -432,10 +431,21 @@ function App() {
     };
 
     // --- reveal cadence ------------------------------------------------------
-    let captionText = ""; // description (pre-wrapped) being typed out this interval
-    const showCaption = (turn) => {
+    let captionText = ""; // caption (pre-wrapped) of the last piece dropped
+    let upcoming = null; // { turn, text }: the next piece's caption, wrapped ahead of time
+    const wrapNote = (turn) => {
       const note = turn.item.note || "";
-      captionText = ghostRef.current ? wrapToLines(ghostRef.current, note) : note;
+      return ghostRef.current ? wrapToLines(ghostRef.current, note) : note;
+    };
+    const upcomingCaption = () => {
+      if (shown >= turns.length) return null;
+      const turn = turns[shown];
+      if (upcoming?.turn !== turn) upcoming = { turn, text: wrapNote(turn) };
+      return upcoming.text;
+    };
+    const showCaption = (turn) => {
+      captionText = upcoming?.turn === turn ? upcoming.text : wrapNote(turn);
+      upcoming = null;
     };
 
     const setBackground = (item) => {
@@ -820,8 +830,9 @@ function App() {
       }
       const caption = captionRef.current;
       if (caption) {
-        const elapsed = Math.min(intervalMs, Math.max(0, intervalMs - remaining));
-        const next = captionText.slice(0, visibleChars(captionText, elapsed, intervalMs));
+        // With nothing queued there's no drop coming, so the current caption just stays.
+        const nextText = upcomingCaption();
+        const next = nextText === null ? captionText : swapCaption(captionText, nextText, remaining, intervalMs);
         if (caption.textContent !== next) caption.textContent = next;
       }
     };
